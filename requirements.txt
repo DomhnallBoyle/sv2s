@@ -1,0 +1,5 @@
+matplotlib==3.5.2
+numpy==1.21.6
+torch==1.12.1
+torchaudio==0.12.1
+torchinfo==1.7.0
