@@ -7,16 +7,19 @@ import torch
 
 class CustomDataset(torch.utils.data.Dataset):
 
+    # TODO: Speed up this, takes ages between steps when using entire sample pool
+
     def __init__(self, sample_pool_location):
         self.sample_pool_location = sample_pool_location
         # self.sample_pool_size = len(self.samples())
-        self.sample_pool_size = 32
-        self._samples = ['grid_sample.npz' for _ in range(self.sample_pool_size)]
+        self.sample_pool_size = 1024
+        self._samples = [f'{r}/{f}' for r, ds, fs in os.walk(self.sample_pool_location)
+                         for f in fs if f[-4:] == '.npz'][:self.sample_pool_size]
 
     def samples(self):
+        return self._samples
         # return [f'{r}/{f}' for r, ds, fs in os.walk(self.sample_pool_location)
         #         for f in fs if f[-4:] == '.npz']
-        return self._samples
 
     def __len__(self):
         return self.sample_pool_size

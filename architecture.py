@@ -53,23 +53,21 @@ def conv2d(in_channels, out_channels, kernel_size, stride, padding):
     )
 
 
-def swish(x):
-    return x * torch.sigmoid(x)
-
-
 class Stem(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
 
-        self.conv_3d = conv3d(in_channels=1, out_channels=64, kernel_size=(5, 7, 7), stride=(1, 2, 2), padding=(2, 3, 3))
+        self.conv_3d = conv3d(in_channels=1, out_channels=64, kernel_size=(5, 7, 7), stride=(1, 2, 2),
+                              padding=(2, 3, 3))
         self.batch_norm_3d = torch.nn.BatchNorm3d(num_features=64)
         self.max_pool_3d = torch.nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
+        self.activation = torch.nn.SiLU()
 
     def forward(self, x):
         x = self.conv_3d(x)
         x = self.batch_norm_3d(x)
-        x = swish(x)
+        x = self.activation(x)
         x = self.max_pool_3d(x)
 
         return x
@@ -80,22 +78,25 @@ class BasicBlock(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, expansion=1, down_sample=None):
         super().__init__()
 
-        self.conv_2d_1 = conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=1)
-        self.conv_2d_2 = conv2d(in_channels=in_channels * expansion, out_channels=out_channels, kernel_size=kernel_size, stride=1, padding=1)
+        self.conv_2d_1 = conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
+                                stride=stride, padding=1)
+        self.conv_2d_2 = conv2d(in_channels=in_channels * expansion, out_channels=out_channels, kernel_size=kernel_size,
+                                stride=1, padding=1)
         self.down_sample = down_sample
         self.batch_norm_2d = torch.nn.BatchNorm2d(num_features=out_channels)
+        self.activation = torch.nn.SiLU()
 
     def forward(self, x):
         residual = x  # skip connection
         x = self.conv_2d_1(x)
         x = self.batch_norm_2d(x)
-        x = swish(x)
+        x = self.activation(x)
         x = self.conv_2d_2(x)
         x = self.batch_norm_2d(x)
         if self.down_sample:
             residual = self.down_sample(residual)
         x += residual
-        x = swish(x)
+        x = self.activation(x)
 
         return x
 
@@ -139,38 +140,57 @@ class Encoder(torch.nn.Module):
 
 
 class Decoder(torch.nn.Module):
-    
+    # https://github.com/hoangtuanvu/conformer_ocr uses similar Resnet + Conformer architecture
+
     def __init__(self, conformer_type='m', device='cpu'):
         super().__init__()
 
         self.device = device
         self.conformer_params = CONFORMER_PARAMS[conformer_type]
+
         self.conformer = Conformer(
             input_dim=self.conformer_params['att_dim'],
             num_heads=self.conformer_params['att_heads'],
             ffn_dim=self.conformer_params['ff_dim'],
             num_layers=self.conformer_params['blocks'],
             depthwise_conv_kernel_size=self.conformer_params['conv_k']
-        )
-        self.linear_projection_1 = torch.nn.Linear(in_features=768, out_features=self.conformer_params['att_dim'])
-        self.linear_projection_2 = torch.nn.Linear(in_features=self.conformer_params['att_dim'], out_features=320)
+        )  # this is a conformer encoder w/ no positional encoder
 
-        self.lstm_decoder = torch.nn.LSTM(256, 256, 1)
+        self.num_input_features = 768
+        self.fc_1 = torch.nn.Linear(in_features=self.num_input_features,
+                                    out_features=self.conformer_params['att_dim'])  # this is a linear layer
+        self.fc_2 = torch.nn.Linear(in_features=self.conformer_params['att_dim'],
+                                    out_features=320)  # this is a projection layer
+        self.activation = torch.nn.ReLU()
+
+        self.reset_parameters()
 
     def forward(self, x):
         # TODO: Can we pass variable length sequences during training?
         #  investigate if reshape is correct here
-        x = x.permute(0, 2, 1)
-        lengths = torch.tensor(TIMESTEPS, dtype=torch.int32).repeat(BATCH_SIZE).to(self.device)  # input lengths
+        lengths = torch.tensor(TIMESTEPS, dtype=torch.int32).repeat(BATCH_SIZE).to(self.device)  # input lengths, shape B. i-th in batch represents no. valid frames
 
-        x = self.linear_projection_1(x)
-        x, lengths = self.conformer(x, lengths)
-        x, _ = self.lstm_decoder(x)
-        x = self.linear_projection_2(x)  # output = [B, T, 320]
+        x = self.fc_1(x)
+        x = self.activation(x)
 
-        x = x.reshape((BATCH_SIZE, TIMESTEPS, 4, 80))
+        x, lengths = self.conformer(x, lengths)  # input = [B, T, N]
 
-        return x.reshape(BATCH_SIZE, 80, 80)  # 80 frames per second
+        x = self.fc_2(x)  # output = [B, T, 320]
+
+        x = x.view(BATCH_SIZE, TIMESTEPS, 4, 80)
+
+        return x.view(BATCH_SIZE, 80, 80)  # 80 frames per second
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.constant_(m.bias, 0.)
+
+        for fc in [self.fc_1, self.fc_2]:
+            init_weights(fc)
+
+        self.conformer.apply(init_weights)
 
 
 class V2S(torch.nn.Module):
@@ -188,6 +208,7 @@ class V2S(torch.nn.Module):
         # concat speaker embeddings
         # embeddings need repeated for T to concat i.e. same embedding per frame
         x = torch.cat((x, speaker_embeddings.repeat(1, 1, TIMESTEPS)), 1)  # output = [B, 768, T]
+        x = x.permute(0, 2, 1)  # output = [B, T, 768]
 
         # conformer decoder
         x = self.decoder(x)
@@ -196,13 +217,17 @@ class V2S(torch.nn.Module):
 
 
 def main():
-    windows = torch.rand((BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH))
-    speaker_embeddings = torch.rand((BATCH_SIZE, 256, 1))
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print('Using:', device)
 
-    net = V2S(conformer_type='s', device='cpu')
-    summary(net, input_size=[(32, 1, 20, 88, 88), (32, 256, 1)], device='cpu')
-    net(windows, speaker_embeddings)
+    windows = torch.rand((BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH)).to(device)
+    speaker_embeddings = torch.rand((BATCH_SIZE, 256, 1)).to(device)
+
+    net = V2S(conformer_type='s', device=device).to(device)
+    print(summary(net, input_size=[(32, 1, 20, 88, 88), (32, 256, 1)], device=device))
+    output = net(windows, speaker_embeddings)
+    print(output.shape)
 
 
-if __name__ == '__main__': 
+if __name__ == '__main__':
     main()
