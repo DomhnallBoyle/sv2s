@@ -8,5 +8,4 @@ class SpectralConvergenceLoss(torch.nn.Module):
         super().__init__()
 
     def forward(self, gt, pred):
-        # TODO: so i need to do stft?
         return torch.norm(pred - gt, p='fro') / torch.norm(pred, p='fro')

@@ -5,9 +5,10 @@ from scipy import signal
 from scipy.io import wavfile
 
 _inv_mel_basis = None
+# plt.switch_backend('agg')
 
 
-def plot_spectrogram(pred_spectrogram, path, title=None, split_title=False, target_spectrogram=None, max_len=None, auto_aspect=False):
+def plot_spectrogram(pred_spectrogram, title=None, target_spectrogram=None, max_len=None, auto_aspect=False):
     if max_len is not None:
         target_spectrogram = target_spectrogram[:max_len]
         pred_spectrogram = pred_spectrogram[:max_len]
@@ -38,8 +39,8 @@ def plot_spectrogram(pred_spectrogram, path, title=None, split_title=False, targ
     fig.colorbar(mappable=im, shrink=0.65, orientation="horizontal", ax=ax2)
 
     plt.tight_layout()
-    plt.savefig(path, format="png")
-    plt.close()
+
+    return fig
 
 
 def get_hop_size(hparams):

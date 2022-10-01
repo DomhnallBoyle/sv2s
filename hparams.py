@@ -8,6 +8,10 @@ class HParams:
     sample_rate = 16000
     win_size = 800
     hop_size = 200
+    # n_fft = 2048
+    # sample_rate = 24000
+    # win_size = 1200
+    # hop_size = 300
 
     # mel-spec norm and clipping
     signal_normalization = True
@@ -24,6 +28,7 @@ class HParams:
     # griffin-lim
     power = 1.5
     griffin_lim_iters = 60
+    # griffin_lim_iters = 30
 
     pre_emphasize = True
     pre_emphasis = 0.97

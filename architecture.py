@@ -53,6 +53,23 @@ def conv2d(in_channels, out_channels, kernel_size, stride, padding):
     )
 
 
+def downsample_block(in_channels, out_channels, stride):
+    return torch.nn.Sequential(
+        conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=stride,
+            padding=0
+        ),
+        torch.nn.BatchNorm2d(num_features=out_channels)
+    )
+
+
+def get_num_parameters(net):
+    return sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+
 class Stem(torch.nn.Module):
 
     def __init__(self):
@@ -80,25 +97,26 @@ class BasicBlock(torch.nn.Module):
 
         self.conv_2d_1 = conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
                                 stride=stride, padding=1)
+        self.batch_norm_2d_1 = torch.nn.BatchNorm2d(num_features=out_channels)
         self.conv_2d_2 = conv2d(in_channels=in_channels * expansion, out_channels=out_channels, kernel_size=kernel_size,
                                 stride=1, padding=1)
+        self.batch_norm_2d_2 = torch.nn.BatchNorm2d(num_features=out_channels)
         self.down_sample = down_sample
-        self.batch_norm_2d = torch.nn.BatchNorm2d(num_features=out_channels)
         self.activation = torch.nn.SiLU()
 
     def forward(self, x):
         residual = x  # skip connection
-        x = self.conv_2d_1(x)
-        x = self.batch_norm_2d(x)
-        x = self.activation(x)
-        x = self.conv_2d_2(x)
-        x = self.batch_norm_2d(x)
+        out = self.conv_2d_1(x)
+        out = self.batch_norm_2d_1(out)
+        out = self.activation(out)
+        out = self.conv_2d_2(out)
+        out = self.batch_norm_2d_2(out)
         if self.down_sample:
-            residual = self.down_sample(residual)
-        x += residual
-        x = self.activation(x)
+            residual = self.down_sample(x)
+        out += residual
+        out = self.activation(out)
 
-        return x
+        return out
 
 
 class Encoder(torch.nn.Module):
@@ -113,28 +131,30 @@ class Encoder(torch.nn.Module):
             BasicBlock(64, 64, 3, 1)
         )
         self.res_block_2 = torch.nn.Sequential(
-            BasicBlock(64, 128, 3, 2, expansion=2, down_sample=conv2d(64, 128, 3, 2, 1)),
+            BasicBlock(64, 128, 3, 2, expansion=2, down_sample=downsample_block(64, 128, 2)),
             BasicBlock(128, 128, 3, 1)
         )
         self.res_block_3 = torch.nn.Sequential(
-            BasicBlock(128, 256, 3, 2, expansion=2, down_sample=conv2d(128, 256, 3, 2, 1)),
+            BasicBlock(128, 256, 3, 2, expansion=2, down_sample=downsample_block(128, 256, 2)),
             BasicBlock(256, 256, 3, 1)
         )
         self.res_block_4 = torch.nn.Sequential(
-            BasicBlock(256, 512, 3, 2, expansion=2, down_sample=conv2d(256, 512, 3, 2, 1)),
+            BasicBlock(256, 512, 3, 2, expansion=2, down_sample=downsample_block(256, 512, 2)),
             BasicBlock(512, 512, 3, 1)
         )
-        self.av_pool_2d = torch.nn.AvgPool2d(kernel_size=2)
+        self.av_pool_2d = torch.nn.AdaptiveAvgPool2d(output_size=1)
 
     def forward(self, x):
+        batch_size, timesteps = x.shape[0], x.shape[2]
+
         x = self.stem(x)
-        x = x.reshape((BATCH_SIZE * TIMESTEPS, 64, 22, 22))
+        x = x.view(batch_size * timesteps, 64, 22, 22)
         x = self.res_block_1(x)
         x = self.res_block_2(x)
         x = self.res_block_3(x)
         x = self.res_block_4(x)
         x = self.av_pool_2d(x)
-        x = x.reshape((BATCH_SIZE, 512, TIMESTEPS))
+        x = x.view(batch_size, 512, timesteps)
 
         return x
 
@@ -165,10 +185,8 @@ class Decoder(torch.nn.Module):
 
         self.reset_parameters()
 
-    def forward(self, x):
-        # TODO: Can we pass variable length sequences during training?
-        #  investigate if reshape is correct here
-        lengths = torch.tensor(TIMESTEPS, dtype=torch.int32).repeat(BATCH_SIZE).to(self.device)  # input lengths, shape B. i-th in batch represents no. valid frames
+    def forward(self, x, lengths):
+        batch_size, timesteps = x.shape[:2]
 
         x = self.fc_1(x)
         x = self.activation(x)
@@ -177,9 +195,9 @@ class Decoder(torch.nn.Module):
 
         x = self.fc_2(x)  # output = [B, T, 320]
 
-        x = x.view(BATCH_SIZE, TIMESTEPS, 4, 80)
+        x = x.view(batch_size, timesteps, 4, 80)
 
-        return x.view(BATCH_SIZE, 80, 80)  # 80 frames per second
+        return x.view(batch_size, timesteps * 4, 80)  # 80 frames per second
 
     def reset_parameters(self):
         def init_weights(m):
@@ -201,17 +219,18 @@ class V2S(torch.nn.Module):
         self.encoder = Encoder()
         self.decoder = Decoder(conformer_type=conformer_type, device=device)
 
-    def forward(self, windows, speaker_embeddings):
+    def forward(self, windows, speaker_embeddings, lengths):
         # 3D CNN + Resnet-18
         x = self.encoder(windows)  # input = [B, 1, T, H, W], output = [B, 512, T]
 
         # concat speaker embeddings
         # embeddings need repeated for T to concat i.e. same embedding per frame
-        x = torch.cat((x, speaker_embeddings.repeat(1, 1, TIMESTEPS)), 1)  # output = [B, 768, T]
+        timesteps = windows.shape[2]
+        x = torch.cat((x, speaker_embeddings.repeat(1, 1, timesteps)), 1)  # output = [B, 768, T]
         x = x.permute(0, 2, 1)  # output = [B, T, 768]
 
         # conformer decoder
-        x = self.decoder(x)
+        x = self.decoder(x, lengths)
 
         return x
 
@@ -221,12 +240,22 @@ def main():
     print('Using:', device)
 
     windows = torch.rand((BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH)).to(device)
+    lengths = torch.tensor([TIMESTEPS] * BATCH_SIZE).to(device)
     speaker_embeddings = torch.rand((BATCH_SIZE, 256, 1)).to(device)
 
+    # TODO: Fix this
     net = V2S(conformer_type='s', device=device).to(device)
-    print(summary(net, input_size=[(32, 1, 20, 88, 88), (32, 256, 1)], device=device))
-    output = net(windows, speaker_embeddings)
-    print(output.shape)
+    total_params = sum(p.numel() for p in net.parameters())
+    total_trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+    # print(net)
+    print('Num Params:', total_params)
+    print('Num Trainable Params:', total_trainable_params)
+
+    # print(summary(net, input_size=[(BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH), (BATCH_SIZE, 256, 1), (BATCH_SIZE, 1)], device=device))
+
+    output = net(windows, speaker_embeddings, lengths)
+    print('Output:', output.shape)
 
 
 if __name__ == '__main__':
