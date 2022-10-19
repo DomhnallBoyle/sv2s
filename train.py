@@ -23,7 +23,7 @@ from architecture import V2S
 from asr import DeepSpeechASR
 from dataset import CustomCollate, CustomDataset, PAD_VALUE
 from hparams import HParams
-from loss import SpectralConvergenceLoss
+from loss import CustomLoss
 from optimiser import CustomOptimiser
 from sampler import BucketSampler
 from utils import plot_spectrogram, save_wav, spec_2_wav
@@ -38,10 +38,11 @@ def main(args):
     # if args.debug:
     #     summary(net, input_size=[(32, 1, 20, 88, 88), (32, 256, 1), (32,)], device=device)
 
-    # create losses
-    l1_loss = torch.nn.L1Loss()
+    # create loss function
+    # l1_loss = torch.nn.L1Loss()
     # l1_loss = torch.nn.L1Loss(reduction='none')
-    spectral_convergence_loss = SpectralConvergenceLoss()
+    # spectral_convergence_loss = SpectralConvergenceLoss()
+    criterion = CustomLoss()
 
     # create datasets
     train_dataset = CustomDataset(
@@ -50,7 +51,8 @@ def main(args):
         intensity_augmentation=args.intensity_augmentation,
         time_masking=args.time_masking,
         erasing=args.erasing,
-        random_cropping=args.random_cropping
+        random_cropping=args.random_cropping,
+        use_class_weights=args.use_class_weights
     )
     val_dataset = CustomDataset(location=args.val_dataset_location)
 
@@ -115,7 +117,7 @@ def main(args):
     training_output_directory = Path(f'runs/{args.name}')
     checkpoint_directory = training_output_directory.joinpath('checkpoints')
     checkpoint_directory.mkdir(exist_ok=True, parents=True)
-    with training_output_directory.joinpath('command.txt').open('w') as f:
+    with training_output_directory.joinpath(f'command_{args.run_index}.txt').open('w') as f:
         for arg in sys.argv:
             f.write(f'{arg} \\\n')
 
@@ -128,13 +130,16 @@ def main(args):
     # resume training from specific checkpoint
     optimiser_state = None
     if args.checkpoint_path:
-        checkpoint = torch.load(args.checkpoint_path)
+        # if checkpoint contains GPU tensors, tensors loaded to GPU by default
+        # use map_location='cpu' to avoid GPU usage here
+        checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
         net.load_state_dict(checkpoint['model_state_dict'])
         optimiser_state = checkpoint['optimiser_state_dict']
         epoch = checkpoint['epoch']
         total_iterations = checkpoint['total_iterations']
         best_val_loss = checkpoint['best_val_loss']
         print(f'Loaded model at epoch {epoch}, iterations {total_iterations}')
+        del checkpoint
 
     # create optimiser and lr scheduler
     # it is advised that when multiplying batch size by K, one should multiply LR by sqrt(K)
@@ -168,7 +173,7 @@ def main(args):
         running_loss = 0
 
         for i, train_data in enumerate(train_data_loader):
-            _, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths = train_data  # batch
+            _, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights = train_data  # batch
             windows = windows.to(device)
             speaker_embeddings = speaker_embeddings.to(device)
             lengths = lengths.to(device)
@@ -183,7 +188,9 @@ def main(args):
                 print('GT vs. Pred:', gt_mel_specs[0], outputs[0])
 
             # calculate loss
-            loss = l1_loss(gt_mel_specs, outputs) + spectral_convergence_loss(gt_mel_specs, outputs)
+            loss = criterion(gt_mel_specs, outputs, weights)
+
+            # loss = l1_loss(gt_mel_specs, outputs) + spectral_convergence_loss(gt_mel_specs, outputs)
 
             # # compute the training loss over a batch
             # # padding should not be used in computation of loss - mask it out
@@ -241,7 +248,7 @@ def main(args):
                 with torch.no_grad():  # turn off gradients computation
                     running_val_loss, running_val_stoi, running_val_estoi, running_val_wer, running_val_cer = 0, 0, 0, 0, 0
                     for j, val_data in enumerate(val_data_loader):
-                        _, (val_windows, val_speaker_embeddings, val_lengths), val_gt_mel_specs, val_target_lengths = val_data  # batch
+                        _, (val_windows, val_speaker_embeddings, val_lengths), val_gt_mel_specs, val_target_lengths, val_weights = val_data  # batch
                         val_windows = val_windows.to(device)
                         val_speaker_embeddings = val_speaker_embeddings.to(device)
                         val_lengths = val_lengths.to(device)
@@ -249,7 +256,9 @@ def main(args):
 
                         val_outputs = net(val_windows, val_speaker_embeddings, val_lengths)  # expects ([B, 1, T, H, W], [B, 256, 1])
 
-                        val_loss = l1_loss(val_gt_mel_specs, val_outputs) + spectral_convergence_loss(val_gt_mel_specs, val_outputs)
+                        val_loss = criterion(val_gt_mel_specs, val_outputs, val_weights)
+
+                        # val_loss = l1_loss(val_gt_mel_specs, val_outputs) + spectral_convergence_loss(val_gt_mel_specs, val_outputs)
 
                         # val_batch_loss = 0
                         # val_outputs = torch.nn.utils.rnn.unpad_sequence(val_outputs, val_target_lengths, batch_first=True)
@@ -386,6 +395,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('name')
+    parser.add_argument('run_index', type=int)
     parser.add_argument('training_dataset_location')
     parser.add_argument('val_dataset_location')
     parser.add_argument('--conformer_size', choices=['s', 'm', 'l'], default='s')
@@ -409,6 +419,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_decay', action='store_true')
     parser.add_argument('--eval_n_times', type=int)
     parser.add_argument('--force_eval_batch_size', action='store_true')
+    parser.add_argument('--use_class_weights', action='store_true')
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())

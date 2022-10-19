@@ -5,7 +5,7 @@ from scipy import signal
 from scipy.io import wavfile
 
 _inv_mel_basis = None
-# plt.switch_backend('agg')
+plt.switch_backend('agg')
 
 
 def plot_spectrogram(pred_spectrogram, title=None, target_spectrogram=None, max_len=None, auto_aspect=False):

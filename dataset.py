@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import random
+from pathlib import Path
 
 random.seed(1234)
 
@@ -9,11 +10,13 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from playsound import playsound
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 from torchvision.transforms import CenterCrop, RandomErasing, Normalize
 from tqdm import tqdm
 
-from utils import plot_spectrogram
+from hparams import HParams
+from utils import plot_spectrogram, save_wav, spec_2_wav
 
 FPS = 20
 HEIGHT = 88
@@ -31,6 +34,7 @@ class CustomCollate:
         windows = [torch.Tensor(x[1]) for x in batch]
         speaker_embeddings = torch.from_numpy(np.asarray([x[2] for x in batch]))
         gt_mel_specs = [torch.Tensor(x[3]) for x in batch]
+        weights = torch.Tensor([x[4] for x in batch])
         lengths = torch.Tensor([x[1].shape[0] for x in batch])
         target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs])
 
@@ -88,7 +92,7 @@ class CustomCollate:
         windows = windows.unsqueeze(1)
         speaker_embeddings = speaker_embeddings.unsqueeze(-1)
 
-        return video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths
+        return video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights
 
 
 class RandomCrop:
@@ -107,7 +111,8 @@ class RandomCrop:
 class CustomDataset(torch.utils.data.Dataset):
 
     def __init__(self, location, horizontal_flipping=False, intensity_augmentation=False, time_masking=False,
-                 erasing=False, random_cropping=False, wait_ms=FPS, num_samples=None, debug=False, **kwargs):
+                 erasing=False, random_cropping=False, wait_ms=FPS, num_samples=None, use_class_weights=False,
+                 debug=False, **kwargs):
         self.location = location
         self.augmentation_prob = 0.5
         self.horizontal_flipping = horizontal_flipping
@@ -119,6 +124,7 @@ class CustomDataset(torch.utils.data.Dataset):
         self.num_samples = num_samples
         self.debug = debug
         self.samples = self.get_samples()
+        self.class_weights = self.get_class_weights() if use_class_weights else None
 
         # https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/14b33789c40f931860994eafdef18d05136ef8ef/dataloader/dataloader.py#L86
         self.normalise_1 = Normalize(mean=0.0, std=255.0)
@@ -140,6 +146,30 @@ class CustomDataset(torch.utils.data.Dataset):
             lengths.append(frames.shape[0])
 
         return lengths
+
+    def get_phrase(self, video_path):
+        return Path(video_path).stem.split('_')[0].lower()
+
+    def get_class_weights(self):
+        print('Getting class weights...')
+        class_counts = {}
+        for sample_path in tqdm(self.samples):
+            video_path, _, _, _ = np.load(str(sample_path), allow_pickle=True)['sample']
+            phrase = self.get_phrase(video_path)
+            class_counts[phrase] = class_counts.get(phrase, 0) + 1
+
+        num_classes = len(class_counts)
+        phrases, num_samples_per_class = zip(*class_counts.items())
+        weights = 1 / np.asarray(num_samples_per_class)
+        weights = (weights / np.sum(weights) * num_classes).tolist()
+
+        # TODO: sklearn get_class_weights
+
+        # https://medium.com/gumgum-tech/handling-class-imbalance-by-introducing-sample-weighting-in-the-loss-function-3bdebd8203b4
+        return {phrase: weight for phrase, weight in zip(phrases, weights)}
+
+        # # https://naadispeaks.wordpress.com/2021/07/31/handling-imbalanced-classes-with-weighted-loss-in-pytorch/
+        # return {phrase: 1 - (count / len(self)) for phrase, count in class_counts.items()}
 
     def __len__(self):
         return len(self.samples)
@@ -189,25 +219,17 @@ class CustomDataset(torch.utils.data.Dataset):
         if self.erasing:
             frames = self.erasing(torch.from_numpy(frames.copy())).numpy()
 
-        # TODO: this altogether gives range -2 -> 2, ask about this
-        # frames /= 255.  # min-max normalisation between 0-1
-        # frames = self.normalise(torch.from_numpy(frames.copy())).numpy()
-        # print(frames.max(), frames.min())
-
-        # frames = self.normalise_1(torch.from_numpy(frames.copy()))
-        # frames = self.normalise_2(frames).numpy()
-        # frames = self.normalise_2(torch.from_numpy(frames.copy())).numpy()
-        # print(frames.max(), frames.min())
-
         # normalise frames
         frames = self.normalise_2(self.normalise_1(torch.from_numpy(frames.copy()))).numpy()
+
+        weight = self.class_weights[self.get_phrase(video_path)] if self.class_weights else 1
 
         if self.debug:
             for frame in frames:
                 cv2.imshow('After:', frame)
                 cv2.waitKey(self.wait_ms)
 
-        return video_path, frames, speaker_embedding, mel_spec
+        return video_path, frames, speaker_embedding, mel_spec, weight
 
 
 if __name__ == '__main__':
@@ -219,6 +241,7 @@ if __name__ == '__main__':
     parser.add_argument('--erasing', action='store_true')
     parser.add_argument('--random_cropping', action='store_true')
     parser.add_argument('--last_frame_padding', action='store_true')
+    parser.add_argument('--use_class_weights', action='store_true')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--wait_ms', type=int, default=FPS)
 
@@ -226,24 +249,35 @@ if __name__ == '__main__':
 
     dataset = CustomDataset(**args.__dict__)
     collator = CustomCollate(last_frame_padding=args.last_frame_padding)
+    hparams = HParams()
+
     batch = []
     for i in range(len(dataset)):
-        video_path, frames, speaker_embedding, mel_spec = dataset[i]
+        video_path, frames, speaker_embedding, mel_spec, weight = dataset[i]
         if args.debug:
-            print(i, video_path, frames.shape, speaker_embedding.shape, mel_spec.shape)
-        batch.append([video_path, frames, speaker_embedding, mel_spec])
+            print(i, video_path, frames.shape, speaker_embedding.shape, mel_spec.shape, weight)
+        batch.append([video_path, frames, speaker_embedding, mel_spec, weight])
         if len(batch) == 5:
-            video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths = collator(batch)
-            for video_path, window, speaker_embedding, length, gt_mel_spec, target_length in \
-                    zip(video_paths, windows, speaker_embeddings, lengths, gt_mel_specs, target_lengths):
-                print(video_path, window.shape, speaker_embedding.shape, length, gt_mel_spec.shape, target_length)
+            video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights = collator(batch)
+            for video_path, window, speaker_embedding, length, gt_mel_spec, target_length, weight in \
+                    zip(video_paths, windows, speaker_embeddings, lengths, gt_mel_specs, target_lengths, weights):
+
+                print(video_path, window.shape, speaker_embedding.shape, length, gt_mel_spec.shape, target_length, weight)
+                print(window.max(), window.min())
+
                 for frame in window[0]:
                     frame = cv2.normalize(frame.numpy(), dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                     cv2.imshow('Frame', frame)
                     cv2.waitKey(args.wait_ms)
+
                 gt_mel_spec = gt_mel_spec.numpy()
                 fig = plot_spectrogram(gt_mel_spec)
                 plt.show()
+
+                audio_path = '/tmp/audio.wav'
+                save_wav(spec_2_wav(gt_mel_spec.T, hparams=hparams), save_path=audio_path, sr=hparams.sample_rate)
+                playsound(audio_path, block=True)
+
             batch = []
 
     # show frequency of frame length across dataset

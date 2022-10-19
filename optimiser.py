@@ -27,7 +27,7 @@ class CustomOptimiser:
             self.cosine_scheduler._last_lr = [self._rate]
 
     def state_dict(self):
-        return {key: value for key, value in self.__dict__.items() if key != 'params'}
+        return {key: value for key, value in self.__dict__.items() if key not in ['params', 'decay']}
 
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
