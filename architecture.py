@@ -323,7 +323,7 @@ class ESPNetDecoder(torch.nn.Module):
         batch_size, timesteps = x.shape[:2]
 
         # create masks from lengths
-        max_length = lengths.max()
+        max_length = lengths.max().int()
         masks = torch.arange(max_length).to(self.device).expand(batch_size, max_length) < lengths.unsqueeze(1)
         masks = masks.unsqueeze(1)  # requires [B, 1, T] https://github.com/espnet/espnet/issues/4567
 

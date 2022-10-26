@@ -237,8 +237,8 @@ def main(args):
             if args.eval_n_times:
                 if steps_left in [int(total_steps_left * x) for x in np.arange(0, 1, 1 / args.eval_n_times)]:
                     run_eval = True
-            elif total_iterations == 100 or (i + 1) == len(train_data_loader):
-                # eval at 100 steps or at the end of every epoch
+            elif total_iterations == 100 or (i + 1) == len(train_data_loader) or steps_left == 0:
+                # eval at 100 steps, at the end of every epoch or at the end of training
                 run_eval = True
 
             if run_eval:
@@ -329,9 +329,9 @@ def main(args):
                         writer.add_scalar('WER/val', running_val_wer, global_step=total_iterations)
                         writer.add_scalar('CER/val', running_val_cer, global_step=total_iterations)
 
-                    # save checkpoint if new best val loss or every 5 epochs
+                    # save checkpoint if new best val loss, every 5 epochs or at the end of training
                     # don't save at 100 iterations
-                    save_checkpoint = (running_val_loss < best_val_loss or epoch % 5 == 0) and total_iterations != 100
+                    save_checkpoint = (running_val_loss < best_val_loss or epoch % 5 == 0 or steps_left == 0) and total_iterations != 100
                     if save_checkpoint:
                         checkpoint_path = checkpoint_directory.joinpath(f'model_checkpoint_{epoch}_{total_iterations}.pt')
                         torch.save({
