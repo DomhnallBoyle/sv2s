@@ -112,8 +112,9 @@ class CustomDataset(torch.utils.data.Dataset):
 
     def __init__(self, location, horizontal_flipping=False, intensity_augmentation=False, time_masking=False,
                  erasing=False, random_cropping=False, wait_ms=FPS, num_samples=None, use_class_weights=False,
-                 debug=False, **kwargs):
+                 max_sample_duration=None, debug=False, **kwargs):
         self.location = location
+        assert Path(self.location).exists()
         self.augmentation_prob = 0.5
         self.horizontal_flipping = horizontal_flipping
         self.intensity_augmentation = intensity_augmentation
@@ -122,28 +123,36 @@ class CustomDataset(torch.utils.data.Dataset):
         self.cropping = RandomCrop(size=(HEIGHT, WIDTH)) if random_cropping else CenterCrop(size=(HEIGHT, WIDTH))
         self.wait_ms = wait_ms
         self.num_samples = num_samples
+        self.class_weights = self.get_class_weights() if use_class_weights else None
+        self.max_sample_duration = max_sample_duration
+        self.max_sample_duration_num_frames = self.max_sample_duration * FPS if self.max_sample_duration else None
         self.debug = debug
         self.samples = self.get_samples()
-        self.class_weights = self.get_class_weights() if use_class_weights else None
 
         # https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/14b33789c40f931860994eafdef18d05136ef8ef/dataloader/dataloader.py#L86
         self.normalise_1 = Normalize(mean=0.0, std=255.0)
         self.normalise_2 = Normalize(mean=0.421, std=0.165)
 
     def get_samples(self):
+        print('Getting samples...')
         samples = [f'{r}/{f}' for r, ds, fs in os.walk(self.location) for f in fs if f[-4:] == '.npz']
+
         if self.num_samples is not None:
             random.shuffle(samples)
             samples = samples[:self.num_samples]
 
         return samples
 
+    def get_length(self, sample_path):
+        _, frames, _, _ = np.load(str(sample_path), allow_pickle=True)['sample']
+
+        return frames.shape[0]
+
     def get_lengths(self):
         lengths = []
         print('Getting dataset lengths...')
         for sample_path in tqdm(self.samples):
-            _, frames, _, _ = np.load(str(sample_path), allow_pickle=True)['sample']
-            lengths.append(frames.shape[0])
+            lengths.append(self.get_length(sample_path=sample_path))
 
         return lengths
 
@@ -184,6 +193,23 @@ class CustomDataset(torch.utils.data.Dataset):
                 print('Failed to load sample:', e, sample_path)
                 self.samples = self.get_samples()
                 idx = random.randint(0, len(self) - 1)  # inclusive
+
+        if self.max_sample_duration and len(frames) / FPS > self.max_sample_duration: 
+            # randomly select max sample duration frames and crop the mel-spec to size
+            start_index = random.randint(0, (len(frames) - self.max_sample_duration_num_frames) - 1)  # inclusive
+            end_index = start_index + self.max_sample_duration_num_frames
+            assert end_index < len(frames)
+
+            mel_start_index = int(len(mel_spec) * start_index / len(frames))
+            mel_end_index = mel_start_index + (self.max_sample_duration * FPS * 4)
+
+            frames = frames[start_index:end_index, :, :]
+            assert len(frames) / FPS == self.max_sample_duration
+
+            mel_spec = mel_spec[mel_start_index:mel_end_index, :]
+            assert len(frames) * 4 == len(mel_spec)
+
+        frames = frames.astype(np.float32)
 
         if self.debug:
             for frame in frames:

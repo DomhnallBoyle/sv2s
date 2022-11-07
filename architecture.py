@@ -79,11 +79,6 @@ def get_num_parameters(net):
     return sum(p.numel() for p in net.parameters() if p.requires_grad)
 
 
-def init_weights(m):
-    torch.nn.init.xavier_uniform_(m.weight)
-    torch.nn.init.constant_(m.bias, 0.)
-
-
 def initialise_weights(net, init_type):
     # https://github.com/espnet/espnet/blob/4138010fb66ad27a43e8bee48a4932829a0847ae/espnet/nets/pytorch_backend/transformer/initializer.py#L14 
 
@@ -199,94 +194,6 @@ class Encoder(torch.nn.Module):
         return x
 
 
-class PositionalEncoder(torch.nn.Module):
-    # https://pytorch.org/tutorials/beginner/transformer_tutorial.html
-
-    def __init__(self, d_model, dropout_rate=0., max_len=5000):
-        super().__init__()
-        self.d_model = d_model
-        self.dropout = torch.nn.Dropout(p=dropout_rate)
-
-        position = torch.arange(max_len).unsqueeze(1)  # uses no. timesteps
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))  # uses embedding size
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)  # from dim 0, steps of 2
-        pe[:, 1::2] = torch.cos(position * div_term)  # from dim 1, steps of 2
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        # # scaling: https://datascience.stackexchange.com/questions/87906
-        # x = x * math.sqrt(self.d_model)
-
-        # TODO: does it need scaled?
-
-        x = x + self.pe[:x.shape[1], :]  # only uses based on the sequence lengths
-
-        return self.dropout(x)
-
-
-class Decoder(torch.nn.Module):
-    # https://github.com/hoangtuanvu/conformer_ocr uses similar Resnet + Conformer architecture
-
-    def __init__(self, conformer_type='m', device='cpu'):
-        super().__init__()
-
-        self.device = device
-        self.conformer_params = CONFORMER_PARAMS[conformer_type]
-        self.num_input_features = 768  # 512 encoder + 256 audio embedding features
-
-        self.positional_encoder = PositionalEncoder(
-            d_model=self.conformer_params['att_dim'],
-        )
-
-        self.conformer = Conformer(
-            input_dim=self.conformer_params['att_dim'],
-            num_heads=self.conformer_params['att_heads'],
-            ffn_dim=self.conformer_params['ff_dim'],
-            num_layers=self.conformer_params['blocks'],
-            depthwise_conv_kernel_size=self.conformer_params['conv_k'],
-            # dropout=DROPOUT_RATE  # defaulted to 0
-        )  # this is a conformer encoder w/ no positional encoder
-
-        self.fc_1 = torch.nn.Linear(in_features=self.num_input_features,
-                                    out_features=self.conformer_params['att_dim'])  # this is a linear layer
-        # self.dropout = torch.nn.Dropout(p=DROPOUT_RATE)
-        self.activation = torch.nn.ReLU()
-
-        self.fc_2 = torch.nn.Linear(in_features=self.conformer_params['att_dim'],
-                                    out_features=320)  # this is a projection layer - no activation function
-
-        self.reset_parameters()
-
-    def forward(self, x, lengths):
-        batch_size, timesteps = x.shape[:2]
-
-        x = self.fc_1(x)
-        x = self.activation(x)
-        # x = self.dropout(x)
-
-        x = self.positional_encoder(x)
-
-        x, lengths = self.conformer(x, lengths)  # input = [B, T, N]
-
-        x = self.fc_2(x)  # output = [B, T, 320]
-
-        x = x.view(batch_size, timesteps, 4, 80)
-
-        return x.view(batch_size, timesteps * 4, 80)  # 80 frames per second
-
-    def reset_parameters(self):
-        def init_weights(m):
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                torch.nn.init.constant_(m.bias, 0.)
-
-        for fc in [self.fc_1, self.fc_2]:
-            init_weights(fc)
-
-        self.conformer.apply(init_weights)
-
-
 class ESPNetDecoder(torch.nn.Module): 
     
     def __init__(self, conformer_type='m', device='cpu'):
@@ -341,7 +248,6 @@ class V2S(torch.nn.Module):
         super().__init__()
 
         self.encoder = Encoder()
-        # self.decoder = Decoder(conformer_type=conformer_type, device=device)
         self.decoder = ESPNetDecoder(conformer_type=conformer_type, device=device)
 
         num_encoder_params = get_num_parameters(self.encoder)

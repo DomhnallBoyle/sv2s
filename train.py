@@ -52,9 +52,13 @@ def main(args):
         time_masking=args.time_masking,
         erasing=args.erasing,
         random_cropping=args.random_cropping,
-        use_class_weights=args.use_class_weights
+        use_class_weights=args.use_class_weights,
+        max_sample_duration=args.max_sample_duration
     )
-    val_dataset = CustomDataset(location=args.val_dataset_location)
+    val_dataset = CustomDataset(
+        location=args.val_dataset_location,
+        max_sample_duration=args.max_sample_duration
+    )
 
     # create custom collate fn
     collator = CustomCollate(last_frame_padding=args.last_frame_padding)
@@ -101,13 +105,17 @@ def main(args):
             pin_memory=True
         )
 
+    if args.linear_scaling_lr:
+        # batch size 16 = 0.001 LR
+        args.learning_rate = args.learning_rate * (args.batch_size / 16)
     num_epochs = args.num_epochs
     num_training_samples = len(train_dataset)
     steps_per_epoch = num_training_samples // args.batch_size
     num_steps = num_epochs * steps_per_epoch
     eval_every = steps_per_epoch
     asr_every_num_epochs = 5  # every 5 epochs, run ASR
-    print(f'Num epochs: {num_epochs}\n'
+    print(f'Learning Rate: {args.learning_rate}\n'
+          f'Num epochs: {num_epochs}\n'
           f'Num training samples: {num_training_samples}\n'
           f'Steps per epoch: {steps_per_epoch}\n'
           f'Num steps: {num_steps / 1000}k\n'
@@ -170,10 +178,10 @@ def main(args):
 
     finished_training = False
     while not finished_training:
-        running_loss = 0
+        running_loss, running_step_time = 0, 0
 
         for i, train_data in enumerate(train_data_loader):
-            _, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights = train_data  # batch
+            video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights = train_data  # batch
             windows = windows.to(device)
             speaker_embeddings = speaker_embeddings.to(device)
             lengths = lengths.to(device)
@@ -182,9 +190,11 @@ def main(args):
             # forward + backward + optimise
             start_time = time.time()
             outputs = net(windows, speaker_embeddings, lengths)  # expects ([B, 1, T, H, W], [B, 256, 1])
+            step_time = time.time() - start_time
+            running_step_time += step_time
 
             if args.debug:
-                print(f'Iteration took {time.time() - start_time:.2f}s')
+                print(f'Iteration took {step_time:.2f}s')
                 print('GT vs. Pred:', gt_mel_specs[0], outputs[0])
 
             # calculate loss
@@ -228,10 +238,11 @@ def main(args):
             running_loss += loss.item()
             if (i + 1) % args.log_every == 0:
                 running_loss /= args.log_every
-                print(f'[Epoch: {epoch}, Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser._rate}] loss: {running_loss}')
+                eta_days = ((running_step_time / args.log_every) * steps_left) / 86400  # in days
+                print(f'[Epoch: {epoch}, Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser._rate}] Loss: {running_loss}, ETA: {eta_days:.2f} days')
                 writer.add_scalar('Loss/train', running_loss, global_step=total_iterations)
                 writer.add_scalar('LR', optimiser._rate, global_step=total_iterations)
-                running_loss = 0
+                running_loss, running_step_time = 0, 0
 
             run_eval = False
             if args.eval_n_times:
@@ -248,7 +259,7 @@ def main(args):
                 with torch.no_grad():  # turn off gradients computation
                     running_val_loss, running_val_stoi, running_val_estoi, running_val_wer, running_val_cer = 0, 0, 0, 0, 0
                     for j, val_data in enumerate(val_data_loader):
-                        _, (val_windows, val_speaker_embeddings, val_lengths), val_gt_mel_specs, val_target_lengths, val_weights = val_data  # batch
+                        val_video_paths, (val_windows, val_speaker_embeddings, val_lengths), val_gt_mel_specs, val_target_lengths, val_weights = val_data  # batch
                         val_windows = val_windows.to(device)
                         val_speaker_embeddings = val_speaker_embeddings.to(device)
                         val_lengths = val_lengths.to(device)
@@ -347,7 +358,8 @@ def main(args):
                             best_val_loss = running_val_loss
 
                     # save out validation and training samples
-                    for _windows, _lengths, gts, preds, _target_lengths, name in zip(
+                    for _video_paths, _windows, _lengths, gts, preds, _target_lengths, name in zip(
+                        [video_paths, val_video_paths],
                         [windows, val_windows],
                         [lengths, val_lengths],
                         [gt_mel_specs, val_gt_mel_specs],
@@ -355,6 +367,8 @@ def main(args):
                         [target_lengths, val_target_lengths],
                         ['train', 'val']
                     ):
+                        video_path = _video_paths[0]                        
+
                         window_length = int(_lengths[0].item())
                         target_length = int(_target_lengths[0])
 
@@ -368,6 +382,7 @@ def main(args):
                         assert window.shape[1] == window_length
                         assert (gt.shape[0], pred.shape[0]) == (target_length, target_length)
 
+                        writer.add_text(f'Video Path/{name}', video_path, global_step=total_iterations)
                         writer.add_images(f'Window/{name}', window, global_step=total_iterations, dataformats='CNHW')
                         writer.add_figure(f'Figure/{name}', plot_spectrogram(
                             pred,
@@ -414,12 +429,14 @@ if __name__ == '__main__':
     parser.add_argument('--time_masking', action='store_true')
     parser.add_argument('--erasing', action='store_true')
     parser.add_argument('--random_cropping', action='store_true')
+    parser.add_argument('--max_sample_duration', type=int)
     parser.add_argument('--deepspeech_host')
     parser.add_argument('--reset_optimiser', action='store_true')
     parser.add_argument('--lr_decay', action='store_true')
     parser.add_argument('--eval_n_times', type=int)
     parser.add_argument('--force_eval_batch_size', action='store_true')
     parser.add_argument('--use_class_weights', action='store_true')
+    parser.add_argument('--linear_scaling_lr', action='store_true')
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())
