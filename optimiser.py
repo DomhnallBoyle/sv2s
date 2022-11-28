@@ -2,7 +2,8 @@ import torch
 
 
 class CustomOptimiser:
-    """Based on https://stackoverflow.com/questions/65343377/adam-optimizer-with-warmup-on-pytorch
+    """
+    Based on https://stackoverflow.com/questions/65343377/adam-optimizer-with-warmup-on-pytorch
     Warm-up learning rate for first 10% of iterations and then decay
     """
 

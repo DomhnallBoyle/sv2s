@@ -1,42 +1,12 @@
 import argparse
-import math
 import sys
 
 import torch
-from torchaudio.models import Conformer
-from torchinfo import summary
 
 sys.path.append('vsrml')
 from espnet.nets.pytorch_backend.transformer.encoder import Encoder as ConformerEncoder
-
-BATCH_SIZE = 32
-TIMESTEPS = 20
-HEIGHT = 88
-WIDTH = 88
-CONFORMER_PARAMS = {
-    's': {
-        'blocks': 6,
-        'att_dim': 256,
-        'att_heads': 4,
-        'conv_k': 31,
-        'ff_dim': 2048
-    },
-    'm': {
-        'blocks': 12,
-        'att_dim': 256,
-        'att_heads': 4,
-        'conv_k': 31,
-        'ff_dim': 2048
-    },
-    'l': {
-        'blocks': 12,
-        'att_dim': 512,
-        'att_heads': 8,
-        'conv_k': 31,
-        'ff_dim': 2048
-    }
-}
-DROPOUT_RATE = 0.2
+from hparams import hparams
+from utils import load_pretrained_resnet
 
 
 def conv3d(in_channels, out_channels, kernel_size, stride, padding):
@@ -104,7 +74,6 @@ def initialise_weights(net, init_type):
             m.reset_parameters()
 
 
-
 class Stem(torch.nn.Module):
 
     def __init__(self):
@@ -155,8 +124,10 @@ class BasicBlock(torch.nn.Module):
 
 
 class Encoder(torch.nn.Module):
-    # https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/master/espnet/nets/pytorch_backend/backbones/conv3d_extractor.py
-
+    """
+    Based on https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/master/espnet/nets/pytorch_backend/backbones/conv3d_extractor.py
+    """
+    
     def __init__(self):
         super().__init__()
         
@@ -199,7 +170,7 @@ class ESPNetDecoder(torch.nn.Module):
     def __init__(self, conformer_type='m', device='cpu'):
         super().__init__()
 
-        self.conformer_params = CONFORMER_PARAMS[conformer_type]    
+        self.conformer_params = hparams.conformer_params[conformer_type]    
         self.device = device
         self.num_input_features = 768
         
@@ -244,17 +215,23 @@ class ESPNetDecoder(torch.nn.Module):
 
 class V2S(torch.nn.Module):
 
-    def __init__(self, conformer_type='m', device='cpu'):
+    def __init__(self, conformer_type='m', device='cpu', pretrained_resnet_path=None, freeze_encoder=False):
         super().__init__()
 
         self.encoder = Encoder()
         self.decoder = ESPNetDecoder(conformer_type=conformer_type, device=device)
 
+        if pretrained_resnet_path: 
+            self.encoder = load_pretrained_resnet(self.encoder, pretrained_resnet_path, freeze=freeze_encoder)
+
         num_encoder_params = get_num_parameters(self.encoder)
         num_decoder_params = get_num_parameters(self.decoder)
+        total_params = num_encoder_params + num_decoder_params
+        assert round(total_params / 1000000, 1) == hparams.conformer_params[conformer_type]['total_params']
+
         print('Encoder params:', num_encoder_params)
         print('Decoder params:', num_decoder_params)
-        print('Total params:', num_encoder_params + num_decoder_params, '\n')
+        print('Total params:', total_params, '\n')
 
     def forward(self, windows, speaker_embeddings, lengths):
         # 3D CNN + Resnet-18
@@ -276,17 +253,22 @@ def main(args):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using:', device)
 
-    windows = torch.rand((BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH)).to(device)
-    lengths = torch.tensor([TIMESTEPS] * BATCH_SIZE).to(device)
-    speaker_embeddings = torch.rand((BATCH_SIZE, 256, 1)).to(device)
-
     net = V2S(conformer_type=args.conformer_size, device=device).to(device)
+    batch_size = 6
 
-    # TODO: Fix this
-    # print(summary(net, input_size=[(BATCH_SIZE, 1, TIMESTEPS, HEIGHT, WIDTH), (BATCH_SIZE, 256, 1), (BATCH_SIZE, 1)], device=device))
-
+    # testing same length input
+    windows = torch.rand((batch_size, 1, hparams.fps, hparams.height, hparams.width)).to(device)
+    lengths = torch.tensor([hparams.fps] * batch_size).to(device)
+    speaker_embeddings = torch.rand((batch_size, 256, 1)).to(device)
     output = net(windows, speaker_embeddings, lengths)
-    print('Output:', output.shape)
+    print('Same Length:', output.shape, '\n')
+
+    # testing variable length input
+    lengths = torch.tensor([50, 60, 70, 80, 90, 100])
+    windows = [torch.rand((l, hparams.height, hparams.width)) for l in lengths]
+    windows = torch.nn.utils.rnn.pad_sequence(windows, batch_first=True, padding_value=hparams.pad_value).unsqueeze(1)
+    output = net(windows, speaker_embeddings[:len(lengths)], lengths)
+    print('Variable Length:', output.shape)
 
 
 if __name__ == '__main__':

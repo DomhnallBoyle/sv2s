@@ -1,27 +1,22 @@
 import argparse
 import math
 import os
+import pickle
 import random
 from pathlib import Path
-
-random.seed(1234)
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from playsound import playsound
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+from torch.nn.utils.rnn import pad_sequence
 from torchvision.transforms import CenterCrop, RandomErasing, Normalize
 from tqdm import tqdm
 
-from hparams import HParams
+from hparams import hparams
+from transforms import HorizontalFlipping, IntensityAugmentation, RandomCrop, Slicing, TimeMasking
 from utils import plot_spectrogram, save_wav, spec_2_wav
-
-FPS = 20
-HEIGHT = 88
-WIDTH = 88
-PAD_VALUE = 0.0
 
 
 class CustomCollate:
@@ -35,8 +30,8 @@ class CustomCollate:
         speaker_embeddings = torch.from_numpy(np.asarray([x[2] for x in batch]))
         gt_mel_specs = [torch.Tensor(x[3]) for x in batch]
         weights = torch.Tensor([x[4] for x in batch])
-        lengths = torch.Tensor([x[1].shape[0] for x in batch])
-        target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs])
+        lengths = torch.Tensor([x[1].shape[0] for x in batch]).int()
+        target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs]).int()
 
         # padding with the last frame from the window
         if self.last_frame_padding:
@@ -55,7 +50,7 @@ class CustomCollate:
                 new_window[window_length:max_length, :, :] = last_frame  # finished talking - silence
 
                 mel_spec_length = gt_mel_spec.shape[0]
-                new_gt_mel_spec = torch.zeros((max_audio_length, 80))
+                new_gt_mel_spec = torch.zeros((max_audio_length, hparams.num_mels))
                 new_gt_mel_spec[:mel_spec_length, :] = gt_mel_spec
                 new_gt_mel_spec[mel_spec_length:max_audio_length, :] = gt_mel_spec.min()  # silence
 
@@ -63,12 +58,12 @@ class CustomCollate:
                 new_gt_mel_specs.append(new_gt_mel_spec)
             windows = torch.stack(new_windows)
             gt_mel_specs = torch.stack(new_gt_mel_specs)
-            lengths = torch.Tensor([x.shape[0] for x in windows])
-            target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs])
+            lengths = torch.Tensor([x.shape[0] for x in windows]).int()
+            target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs]).int()
 
         for window, length, gt_mel_spec, target_length in zip(windows, lengths, gt_mel_specs, target_lengths):
             assert window.shape[0] == int(length)
-            assert (window.shape[0] / FPS) == (gt_mel_spec.shape[0] / 80)
+            assert (window.shape[0] / hparams.fps) == (gt_mel_spec.shape[0] / hparams.num_mels)
             assert gt_mel_spec.shape[0] == target_length
             # assert PAD_VALUE not in gt_mel_spec
 
@@ -78,8 +73,8 @@ class CustomCollate:
         # sorted_indices = [x[0] for x in index_lengths_sorted]
 
         # pad sequences
-        windows = pad_sequence(windows, batch_first=True, padding_value=PAD_VALUE)
-        gt_mel_specs = pad_sequence(gt_mel_specs, batch_first=True, padding_value=PAD_VALUE)
+        windows = pad_sequence(windows, batch_first=True, padding_value=hparams.pad_value)
+        gt_mel_specs = pad_sequence(gt_mel_specs, batch_first=True, padding_value=hparams.pad_value)
 
         # # sort data
         # video_paths = [video_paths[i] for i in sorted_indices]
@@ -95,47 +90,48 @@ class CustomCollate:
         return video_paths, (windows, speaker_embeddings, lengths), gt_mel_specs, target_lengths, weights
 
 
-class RandomCrop:
-
-    def __init__(self, size):
-        self.height, self.width = size
-
-    def __call__(self, frames):
-        t, h, w = frames.shape
-        delta_w = random.randint(0, w - self.width)
-        delta_h = random.randint(0, h - self.height)
-
-        return frames[:, delta_h:delta_h + self.height, delta_w:delta_w + self.width]
-
-
 class CustomDataset(torch.utils.data.Dataset):
 
     def __init__(self, location, horizontal_flipping=False, intensity_augmentation=False, time_masking=False,
-                 erasing=False, random_cropping=False, wait_ms=FPS, num_samples=None, use_class_weights=False,
-                 max_sample_duration=None, debug=False, **kwargs):
-        self.location = location
-        assert Path(self.location).exists()
+                 erasing=False, random_cropping=False, wait_ms=hparams.fps, num_samples=None, use_class_weights=False,
+                 min_sample_duration=None, max_sample_duration=None, use_duration_range=False, slicing=False, 
+                 time_mask_by_frame=False, debug=False, **kwargs):
+        self.location = Path(location)
+        assert self.location.exists()
+        self.lengths_location = self.location.joinpath('lengths.pkl')
         self.augmentation_prob = 0.5
-        self.horizontal_flipping = horizontal_flipping
-        self.intensity_augmentation = intensity_augmentation
-        self.time_masking = time_masking
+        self.horizontal_flipping = HorizontalFlipping(p=self.augmentation_prob) if horizontal_flipping else None
+        self.intensity_augmentation = IntensityAugmentation(p=self.augmentation_prob) if intensity_augmentation else None
+        self.time_masking = TimeMasking(debug=debug) if time_masking else None
         self.erasing = RandomErasing(p=self.augmentation_prob, scale=(0.02, 0.33), ratio=(0.3, 3.3)) if erasing else None
-        self.cropping = RandomCrop(size=(HEIGHT, WIDTH)) if random_cropping else CenterCrop(size=(HEIGHT, WIDTH))
+        self.cropping = RandomCrop(size=(hparams.height, hparams.width)) if random_cropping else CenterCrop(size=(hparams.height, hparams.width))
+        self.slicing = Slicing() if slicing else None
         self.wait_ms = wait_ms
         self.num_samples = num_samples
-        self.class_weights = self.get_class_weights() if use_class_weights else None
+        self.min_sample_duration = min_sample_duration
         self.max_sample_duration = max_sample_duration
-        self.max_sample_duration_num_frames = self.max_sample_duration * FPS if self.max_sample_duration else None
+        self.use_duration_range = use_duration_range
+        self.time_masking_axis = 0 if time_mask_by_frame else None  # can be frame (0 = vsrml) or pixel value (None = sv2s)
         self.debug = debug
+
+        self.sample_paths = [f'{r}/{f}' for r, ds, fs in os.walk(self.location) for f in fs if f[-4:] == '.npz']
+        self.lengths = self.get_lengths()
         self.samples = self.get_samples()
+        self.class_weights = self.get_class_weights() if use_class_weights else None
 
         # https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/14b33789c40f931860994eafdef18d05136ef8ef/dataloader/dataloader.py#L86
         self.normalise_1 = Normalize(mean=0.0, std=255.0)
         self.normalise_2 = Normalize(mean=0.421, std=0.165)
 
+        if self.use_duration_range or self.slicing: 
+            assert self.min_sample_duration is not None and self.max_sample_duration is not None
+
     def get_samples(self):
-        print('Getting samples...')
-        samples = [f'{r}/{f}' for r, ds, fs in os.walk(self.location) for f in fs if f[-4:] == '.npz']
+        print(f'Getting samples from {self.location}...')
+        samples = self.sample_paths.copy()
+
+        if self.use_duration_range:
+            samples = [s for s in samples if self.min_sample_duration <= self.get_duration(s) <= self.max_sample_duration]
 
         if self.num_samples is not None:
             random.shuffle(samples)
@@ -143,16 +139,33 @@ class CustomDataset(torch.utils.data.Dataset):
 
         return samples
 
+    def get_duration(self, sample_path): 
+        return self.lengths[sample_path] / hparams.fps
+
+    def get_random_duration_num_frames(self): 
+        return random.randint(
+            self.min_sample_duration * hparams.fps, 
+            self.max_sample_duration * hparams.fps
+        )  # inclusive 
+
     def get_length(self, sample_path):
         _, frames, _, _ = np.load(str(sample_path), allow_pickle=True)['sample']
 
         return frames.shape[0]
 
     def get_lengths(self):
-        lengths = []
         print('Getting dataset lengths...')
-        for sample_path in tqdm(self.samples):
-            lengths.append(self.get_length(sample_path=sample_path))
+
+        if self.lengths_location.exists():
+            with self.lengths_location.open('rb') as f:
+                return pickle.load(f)
+
+        lengths = {}
+        for sample_path in tqdm(self.sample_paths):
+            lengths[sample_path] = self.get_length(sample_path=sample_path)
+
+        with self.lengths_location.open('wb') as f:
+            pickle.dump(lengths, f)
 
         return lengths
 
@@ -184,30 +197,22 @@ class CustomDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):  # random index
-        while True:
-            sample_path = self.samples[idx]
-            try:
-                video_path, frames, speaker_embedding, mel_spec = np.load(str(sample_path), allow_pickle=True)['sample']
-                break
-            except Exception as e:
-                print('Failed to load sample:', e, sample_path)
-                self.samples = self.get_samples()
-                idx = random.randint(0, len(self) - 1)  # inclusive
+        if type(idx) is list:
+            idx, length = idx  # from bucketing
+        else:
+            length = None
 
-        if self.max_sample_duration and len(frames) / FPS > self.max_sample_duration: 
-            # randomly select max sample duration frames and crop the mel-spec to size
-            start_index = random.randint(0, (len(frames) - self.max_sample_duration_num_frames) - 1)  # inclusive
-            end_index = start_index + self.max_sample_duration_num_frames
-            assert end_index < len(frames)
-
-            mel_start_index = int(len(mel_spec) * start_index / len(frames))
-            mel_end_index = mel_start_index + (self.max_sample_duration * FPS * 4)
-
-            frames = frames[start_index:end_index, :, :]
-            assert len(frames) / FPS == self.max_sample_duration
-
-            mel_spec = mel_spec[mel_start_index:mel_end_index, :]
-            assert len(frames) * 4 == len(mel_spec)
+        sample_path = self.samples[idx]
+        video_path, frames, speaker_embedding, mel_spec = np.load(str(sample_path), allow_pickle=True)['sample']
+        
+        if self.slicing and self.get_duration(sample_path) > self.max_sample_duration:
+            # randomly select min duration frames <= x <= max duration frames and crop the mel-spec to size
+            if length is None: 
+                duration_num_frames = self.get_random_duration_num_frames()
+            else:
+                duration_num_frames = length
+            
+            frames, mel_spec = self.slicing(frames, mel_spec, duration_num_frames)
 
         frames = frames.astype(np.float32)
 
@@ -216,28 +221,13 @@ class CustomDataset(torch.utils.data.Dataset):
                 cv2.imshow('Before:', frame / 255.)
                 cv2.waitKey(self.wait_ms)
 
-        if self.time_masking:
-            mean_frame = np.mean(frames, axis=0)
-            num_masks = len(frames) // FPS
-            for j in range(num_masks):
-                mask_duration_secs = np.random.uniform(0, 0.4)
-                mask_duration_frames = math.ceil(FPS * mask_duration_secs)  # choose num frames to mask
-                frame_index = random.randint(j * FPS, ((j * FPS) + FPS) - mask_duration_frames)  # choose start index of mask
-                frames[frame_index:frame_index + mask_duration_frames, :, :] = mean_frame
-                if self.debug:
-                    print(f'Mask {j + 1}:', mask_duration_secs, mask_duration_frames, frame_index, frame_index + mask_duration_frames, len(frames))
+        mean_time_mask_value = np.mean(frames, axis=self.time_masking_axis)  # can be frame (0 = vsrml) or pixel value (None = sv2s)
 
-        apply_flipping = self.horizontal_flipping and random.random() < self.augmentation_prob
-        apply_intensity_augmentation = self.intensity_augmentation and random.random() < self.augmentation_prob
-
-        if apply_flipping:
-            frames = frames[..., :, ::-1]  # flip along vertical axis
+        if self.horizontal_flipping:
+            frames = self.horizontal_flipping(frames)
         
-        if apply_intensity_augmentation: 
-            intensity = np.random.randint(-30, 30)  # inclusive
-            frames += intensity
-            frames = np.where(frames > 255, 255, frames)
-            frames = np.where(frames < 0, 0, frames)  # capping frame values
+        if self.intensity_augmentation: 
+            frames = self.intensity_augmentation(frames)
 
         # perform random cropping or centre crop to 88x88
         frames = self.cropping(torch.from_numpy(frames.copy())).numpy()
@@ -245,6 +235,9 @@ class CustomDataset(torch.utils.data.Dataset):
         if self.erasing:
             frames = self.erasing(torch.from_numpy(frames.copy())).numpy()
 
+        if self.time_masking:
+            frames = self.time_masking(frames, mean_time_mask_value)
+            
         # normalise frames
         frames = self.normalise_2(self.normalise_1(torch.from_numpy(frames.copy()))).numpy()
 
@@ -268,14 +261,14 @@ if __name__ == '__main__':
     parser.add_argument('--random_cropping', action='store_true')
     parser.add_argument('--last_frame_padding', action='store_true')
     parser.add_argument('--use_class_weights', action='store_true')
+    parser.add_argument('--time_mask_by_frame', action='store_true')
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--wait_ms', type=int, default=FPS)
+    parser.add_argument('--wait_ms', type=int, default=hparams.fps)
 
     args = parser.parse_args()
 
     dataset = CustomDataset(**args.__dict__)
     collator = CustomCollate(last_frame_padding=args.last_frame_padding)
-    hparams = HParams()
 
     batch = []
     for i in range(len(dataset)):

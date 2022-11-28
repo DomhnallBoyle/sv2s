@@ -1,6 +1,7 @@
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from scipy import signal
 from scipy.io import wavfile
 
@@ -8,10 +9,13 @@ _inv_mel_basis = None
 plt.switch_backend('agg')
 
 
-def plot_spectrogram(pred_spectrogram, title=None, target_spectrogram=None, max_len=None, auto_aspect=False):
+def plot_spectrogram(pred_spectrogram, title=None, target_spectrogram=None, max_len=None, auto_aspect=False, loss=None):
     if max_len is not None:
         target_spectrogram = target_spectrogram[:max_len]
         pred_spectrogram = pred_spectrogram[:max_len]
+
+    if loss is not None:
+        title += f'\nLoss: {loss}'
 
     fig = plt.figure(figsize=(10, 8))
     # set common labels
@@ -128,3 +132,77 @@ def save_wav(wav, save_path, sr):
     wav *= 32767 / max(0.01, np.max(np.abs(wav)))
 
     wavfile.write(save_path, sr, wav.astype(np.int16))
+
+
+def load_pretrained_resnet(encoder, pretrained_path, freeze=False):
+    pm = torch.load(pretrained_path)
+
+    def copy(p, v):
+        p.data.copy_(v)
+
+    # stem
+    stem = encoder.stem
+    copy(stem.conv_3d.weight, pm['encoder.frontend.frontend3D.0.weight'])
+    for attr in ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']: 
+        p = getattr(stem.batch_norm_3d, attr)
+        copy(p, pm[f'encoder.frontend.frontend3D.1.{attr}'])
+
+    # trunks
+    for i in range(1, 5):  # layer 
+        for j in range(2):  # block
+            # conv_2d_1
+            copy(
+                getattr(encoder, f'res_block_{i}')[j].conv_2d_1.weight,
+                pm[f'encoder.frontend.trunk.layer{i}.{j}.conv1.weight']
+            )
+
+            # batch_norm_2d_1
+            p = getattr(encoder, f'res_block_{i}')[j].batch_norm_2d_1
+            for attr in ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']:
+                copy(
+                    getattr(p, attr), 
+                    pm[f'encoder.frontend.trunk.layer{i}.{j}.bn1.{attr}']
+                )
+
+            # conv_2d_2
+            copy(
+                getattr(encoder, f'res_block_{i}')[j].conv_2d_2.weight,
+                pm[f'encoder.frontend.trunk.layer{i}.{j}.conv2.weight']
+            )
+
+            # batch_norm_2d_1
+            p = getattr(encoder, f'res_block_{i}')[j].batch_norm_2d_2
+            for attr in ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']:
+                copy(
+                    getattr(p, attr), 
+                    pm[f'encoder.frontend.trunk.layer{i}.{j}.bn2.{attr}']
+                )
+
+            # occurs in first block of layers 2-4
+            is_downsample = i in [2, 3, 4] and j == 0
+            if is_downsample: 
+                copy(
+                    getattr(encoder, f'res_block_{i}')[j].down_sample[0].weight,
+                    pm[f'encoder.frontend.trunk.layer{i}.{j}.downsample.0.weight']
+                )
+                p = getattr(encoder, f'res_block_{i}')[j].down_sample[1]
+                for attr in ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']:
+                    copy(
+                        getattr(p, attr),
+                        pm[f'encoder.frontend.trunk.layer{i}.{j}.downsample.1.{attr}']
+                    )
+
+    # freeze everything except the batch norm layers
+    # requires_grad = False = frozen = not updated
+    for name, param in encoder.named_parameters(): 
+        if freeze and 'batch_norm' not in name: 
+            param.requires_grad = False 
+        else:
+            assert param.requires_grad
+
+    total = 0
+    for name, p in encoder.named_parameters():  # weights, biases only
+        total += p.data.sum()
+    assert total.int() == -45892, f'{total.int()} != -45892'  # taken from resnet
+
+    return encoder

@@ -1,4 +1,3 @@
-
 class HParams:
 
     num_mels = 80
@@ -32,3 +31,38 @@ class HParams:
 
     pre_emphasize = True
     pre_emphasis = 0.97
+
+    height = 88
+    width = 88
+    fps = 20
+    conformer_params = {
+        's': {
+            'blocks': 6,
+            'att_dim': 256,
+            'att_heads': 4,
+            'conv_k': 31,
+            'ff_dim': 2048,
+            'total_params': 27.3
+        },
+        'm': {
+            'blocks': 12,
+            'att_dim': 256,
+            'att_heads': 4,
+            'conv_k': 31,
+            'ff_dim': 2048,
+            'total_params': 43.1
+        },
+        'l': {
+            'blocks': 12,
+            'att_dim': 512,
+            'att_heads': 8,
+            'conv_k': 31,
+            'ff_dim': 2048,
+            'total_params': 87.6
+        }
+    }
+    seed = 1234
+    pad_value = 0.0
+
+
+hparams = HParams()

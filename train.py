@@ -10,38 +10,54 @@ import torch
 from jiwer import cer as calculate_cer, wer as calculate_wer
 from pystoi import stoi
 from torch.utils.tensorboard import SummaryWriter
-from torchinfo import summary
 from tqdm import tqdm
-
-# seed the randomisers
-SEED = 1234
-torch.manual_seed(SEED)
-random.seed(SEED)
-np.random.seed(SEED)
 
 from architecture import V2S
 from asr import DeepSpeechASR
-from dataset import CustomCollate, CustomDataset, PAD_VALUE
-from hparams import HParams
+from dataset import CustomCollate, CustomDataset
+from hparams import hparams
 from loss import CustomLoss
 from optimiser import CustomOptimiser
 from sampler import BucketSampler
 from utils import plot_spectrogram, save_wav, spec_2_wav
 
+log_path = None
+
+
+def log(s):
+    print(s)
+    with log_path.open('a') as f:
+        f.write(f'{s}\n')
+
 
 def main(args):
+    global log_path
+
+    # seed the randomisers
+    torch.manual_seed(hparams.seed)
+    random.seed(hparams.seed)
+    np.random.seed(hparams.seed)
+
+    training_output_directory = Path(f'runs/{args.name}')
+    checkpoint_directory = training_output_directory.joinpath('checkpoints')
+    checkpoint_directory.mkdir(exist_ok=True, parents=True)
+    log_path = training_output_directory.joinpath(f'log_{args.run_index}.txt')
+    with log_path.open('w') as f:
+        for arg in sys.argv:
+            f.write(f'{arg} \\\n')
+
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print('Using:', device)
+    log(f'\nUsing: {device}')
 
     # create network
-    net = V2S(conformer_type=args.conformer_size, device=device).to(device)
-    # if args.debug:
-    #     summary(net, input_size=[(32, 1, 20, 88, 88), (32, 256, 1), (32,)], device=device)
+    net = V2S(
+        conformer_type=args.conformer_size, 
+        device=device, 
+        pretrained_resnet_path=args.pretrained_resnet_path, 
+        freeze_encoder=args.freeze_encoder
+    ).to(device)
 
     # create loss function
-    # l1_loss = torch.nn.L1Loss()
-    # l1_loss = torch.nn.L1Loss(reduction='none')
-    # spectral_convergence_loss = SpectralConvergenceLoss()
     criterion = CustomLoss()
 
     # create datasets
@@ -53,11 +69,19 @@ def main(args):
         erasing=args.erasing,
         random_cropping=args.random_cropping,
         use_class_weights=args.use_class_weights,
-        max_sample_duration=args.max_sample_duration
+        min_sample_duration=args.min_sample_duration,
+        max_sample_duration=args.max_sample_duration,
+        use_duration_range=args.train_use_duration_range,
+        slicing=args.slicing,
+        time_mask_by_frame=args.time_mask_by_frame,
+        num_samples=args.num_samples
     )
     val_dataset = CustomDataset(
         location=args.val_dataset_location,
-        max_sample_duration=args.max_sample_duration
+        min_sample_duration=args.min_sample_duration,
+        max_sample_duration=args.max_sample_duration,
+        use_duration_range=args.val_use_duration_range,
+        num_samples=args.num_samples
     )
 
     # create custom collate fn
@@ -72,8 +96,9 @@ def main(args):
             collate_fn=collator,
             pin_memory=True,
             batch_sampler=BucketSampler(
+                dataset=train_dataset,
                 batch_size=args.batch_size,
-                lengths=train_dataset.get_lengths()
+                force_batch_size=args.force_train_batch_size
             )
         )
         val_data_loader = torch.utils.data.DataLoader(
@@ -82,9 +107,8 @@ def main(args):
             collate_fn=collator,
             pin_memory=True,
             batch_sampler=BucketSampler(
-                batch_size=args.batch_size,
-                lengths=val_dataset.get_lengths(),
-                force_batch_size=args.force_eval_batch_size
+                dataset=val_dataset,
+                batch_size=args.batch_size
             )
         )
     else:
@@ -95,6 +119,7 @@ def main(args):
             shuffle=True,
             collate_fn=collator,
             pin_memory=True,
+            drop_last=True
         )
         val_data_loader = torch.utils.data.DataLoader(
             val_dataset,
@@ -102,32 +127,30 @@ def main(args):
             num_workers=1,
             shuffle=True,
             collate_fn=collator,
-            pin_memory=True
+            pin_memory=True,
+            drop_last=True
         )
 
+    args.gradient_accumulation = args.gradient_accumulation_steps is not None
     if args.linear_scaling_lr:
         # batch size 16 = 0.001 LR
-        args.learning_rate = args.learning_rate * (args.batch_size / 16)
+        args.learning_rate *= (args.batch_size / 16)
     num_epochs = args.num_epochs
     num_training_samples = len(train_dataset)
-    steps_per_epoch = num_training_samples // args.batch_size
+    num_val_samples = len(val_dataset)
+    steps_per_epoch = len(train_data_loader) if args.bucketing else num_training_samples // args.batch_size
     num_steps = num_epochs * steps_per_epoch
     eval_every = steps_per_epoch
     asr_every_num_epochs = 5  # every 5 epochs, run ASR
-    print(f'Learning Rate: {args.learning_rate}\n'
-          f'Num epochs: {num_epochs}\n'
-          f'Num training samples: {num_training_samples}\n'
-          f'Steps per epoch: {steps_per_epoch}\n'
-          f'Num steps: {num_steps / 1000}k\n'
-          f'Epoch/eval every {eval_every} steps\n'
-          f'ASR every {asr_every_num_epochs} epochs')
-
-    training_output_directory = Path(f'runs/{args.name}')
-    checkpoint_directory = training_output_directory.joinpath('checkpoints')
-    checkpoint_directory.mkdir(exist_ok=True, parents=True)
-    with training_output_directory.joinpath(f'command_{args.run_index}.txt').open('w') as f:
-        for arg in sys.argv:
-            f.write(f'{arg} \\\n')
+    training_stats = f'\nLearning Rate: {args.learning_rate}\n' \
+        f'Num epochs: {num_epochs}\n' \
+        f'Num training samples: {num_training_samples}\n' \
+        f'Num val samples: {num_val_samples}\n' \
+        f'Steps per epoch: {steps_per_epoch}\n' \
+        f'Num steps: {num_steps / 1000}k\n' \
+        f'Epoch/eval every {eval_every} steps\n' \
+        f'ASR every {asr_every_num_epochs} epochs'
+    log(training_stats)
 
     # create tensorboard
     writer = SummaryWriter(training_output_directory)
@@ -146,7 +169,7 @@ def main(args):
         epoch = checkpoint['epoch']
         total_iterations = checkpoint['total_iterations']
         best_val_loss = checkpoint['best_val_loss']
-        print(f'Loaded model at epoch {epoch}, iterations {total_iterations}')
+        log(f'Loaded model at epoch {epoch}, iterations {total_iterations}')
         del checkpoint
 
     # create optimiser and lr scheduler
@@ -155,25 +178,23 @@ def main(args):
     optimiser = CustomOptimiser(
         params=net.parameters(),
         target_lr=args.learning_rate,
-        num_steps=num_steps,
+        num_steps=num_steps / args.gradient_accumulation_steps if args.gradient_accumulation else num_steps,
         warmup_rate=args.warmup_rate,
         decay=args.lr_decay
     )
     if optimiser_state and not args.reset_optimiser:
         optimiser.load_state_dict(optimiser_state)
         steps_left = num_steps - total_iterations
-        print('Loaded optimiser state')
+        log('Loaded optimiser state')
     else:
         steps_left = num_steps
     total_steps_left = steps_left
     optimiser.init()
-    print(f'Warmup steps: {optimiser.warmup_steps}\n'
-          f'Steps left: {steps_left}\n')
+    log(f'Warmup steps: {optimiser.warmup_steps}\nSteps left: {steps_left}\n')
 
     net.train()
     net.zero_grad()  # zero the param gradients - same as optim.zero_grad()
 
-    hparams = HParams()
     deepspeech_asr = DeepSpeechASR(args.deepspeech_host) if args.deepspeech_host else None
 
     finished_training = False
@@ -190,56 +211,37 @@ def main(args):
             # forward + backward + optimise
             start_time = time.time()
             outputs = net(windows, speaker_embeddings, lengths)  # expects ([B, 1, T, H, W], [B, 256, 1])
+
+            # calculate loss
+            loss = criterion(gt_mel_specs, outputs, target_lengths, weights)
+            running_loss += loss.item()
+            if args.gradient_accumulation:
+                loss /= args.gradient_accumulation_steps
+            loss.backward()  # accumulates the gradients from every forward pass
+
+            if args.gradient_accumulation: 
+                if (i + 1) % args.gradient_accumulation_steps == 0: 
+                    optimiser.step()
+                    optimiser.zero_grad()  # only zero the gradients after every update
+            else:
+                optimiser.step()
+                optimiser.zero_grad()
+
             step_time = time.time() - start_time
             running_step_time += step_time
 
             if args.debug:
-                print(f'Iteration took {step_time:.2f}s')
-                print('GT vs. Pred:', gt_mel_specs[0], outputs[0])
-
-            # calculate loss
-            loss = criterion(gt_mel_specs, outputs, weights)
-
-            # loss = l1_loss(gt_mel_specs, outputs) + spectral_convergence_loss(gt_mel_specs, outputs)
-
-            # # compute the training loss over a batch
-            # # padding should not be used in computation of loss - mask it out
-            # batch_loss = 0
-            # for gt_mel_spec, output, mask in zip(gt_mel_specs, outputs, masks):
-            #     mask = mask.to(device)
-            #     gt_mel_spec, output = gt_mel_spec.masked_select(mask).reshape(-1, 80), output.masked_select(mask).reshape(-1, 80)
-            #     batch_loss += (l1_loss(gt_mel_spec, output) + spectral_convergence_loss(gt_mel_spec, output))
-            # loss = batch_loss / len(gt_mel_specs)
-
-            # # compute the training loss over a batch
-            # # padding should not be used in computation of loss - mask it out
-            # batch_loss = 0
-            # outputs = torch.nn.utils.rnn.unpad_sequence(outputs, target_lengths, batch_first=True)
-            # for gt_mel_spec, output in zip(gt_mel_specs, outputs):
-            #     gt_mel_spec = gt_mel_spec.to(device)
-            #     assert gt_mel_spec.shape == output.shape
-            #     batch_loss += (l1_loss(gt_mel_spec, output) + spectral_convergence_loss(gt_mel_spec, output))
-            # loss = batch_loss / len(gt_mel_specs)
-
-            # calculate loss
-            # https://discuss.pytorch.org/t/ignore-padding-area-in-loss-computation/95804
-            # loss = l1_loss(gt_mel_specs, outputs) + spectral_convergence_loss(gt_mel_specs, outputs)  # unreduced loss
-            # loss_mask = (gt_mel_specs != PAD_VALUE).to(device)  # mask out loss values where there's padding
-            # loss_masked = loss.where(loss_mask, torch.tensor(PAD_VALUE).to(device))  # this has been tested
-            # loss = loss_masked.sum() / loss_mask.sum()  # reduce loss (mean of non-padded values)
-
-            loss.backward()
-            optimiser.step()
-            optimiser.zero_grad()
+                log(f'Iteration took {step_time:.2f}s')
+                log(f'GT vs. Pred: {gt_mel_specs[0]}\n{outputs[0]}')
 
             total_iterations += 1
             steps_left -= 1
 
-            running_loss += loss.item()
             if (i + 1) % args.log_every == 0:
                 running_loss /= args.log_every
                 eta_days = ((running_step_time / args.log_every) * steps_left) / 86400  # in days
-                print(f'[Epoch: {epoch}, Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser._rate}] Loss: {running_loss}, ETA: {eta_days:.2f} days')
+                epoch_progress = round((epoch / num_epochs) * 100, 1)
+                log(f'[Epoch: {epoch}/{num_epochs} ({epoch_progress}%), Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser._rate}] Loss: {running_loss}, ETA: {eta_days:.2f} days')
                 writer.add_scalar('Loss/train', running_loss, global_step=total_iterations)
                 writer.add_scalar('LR', optimiser._rate, global_step=total_iterations)
                 running_loss, running_step_time = 0, 0
@@ -251,9 +253,9 @@ def main(args):
             elif total_iterations == 100 or (i + 1) == len(train_data_loader) or steps_left == 0:
                 # eval at 100 steps, at the end of every epoch or at the end of training
                 run_eval = True
-
+        
             if run_eval:
-                print('Running evaluation...')
+                log('Running evaluation...')
                 # run validation data
                 net.eval()  # switch to evaluation mode
                 with torch.no_grad():  # turn off gradients computation
@@ -267,22 +269,7 @@ def main(args):
 
                         val_outputs = net(val_windows, val_speaker_embeddings, val_lengths)  # expects ([B, 1, T, H, W], [B, 256, 1])
 
-                        val_loss = criterion(val_gt_mel_specs, val_outputs, val_weights)
-
-                        # val_loss = l1_loss(val_gt_mel_specs, val_outputs) + spectral_convergence_loss(val_gt_mel_specs, val_outputs)
-
-                        # val_batch_loss = 0
-                        # val_outputs = torch.nn.utils.rnn.unpad_sequence(val_outputs, val_target_lengths, batch_first=True)
-                        # for val_gt_mel_spec, val_output in zip(val_gt_mel_specs, val_outputs):
-                        #     val_gt_mel_spec = val_gt_mel_spec.to(device)
-                        #     assert val_gt_mel_spec.shape == val_output.shape
-                        #     val_batch_loss += (l1_loss(val_gt_mel_spec, val_output) + spectral_convergence_loss(val_gt_mel_spec, val_output))
-                        # val_loss = val_batch_loss / len(val_gt_mel_specs)
-
-                        # val_loss = l1_loss(val_gt_mel_specs, val_outputs) + spectral_convergence_loss(val_gt_mel_specs, val_outputs)
-                        # val_loss_mask = (val_gt_mel_specs != PAD_VALUE).to(device)
-                        # val_loss_masked = val_loss.where(val_loss_mask, torch.tensor(PAD_VALUE).to(device))
-                        # val_loss = val_loss_masked.sum() / val_loss_mask.sum()
+                        val_loss = criterion(val_gt_mel_specs, val_outputs, val_target_lengths, val_weights)
 
                         running_val_loss += val_loss.item()
 
@@ -312,12 +299,13 @@ def main(args):
                                     av_wer += calculate_wer(gt_prediction, pred_prediction)
                                     av_cer += calculate_cer(gt_prediction, pred_prediction)
                                 except ValueError:
-                                    print(f'WER/CER failed: {gt_prediction}, {pred_prediction}')
+                                    log(f'WER/CER failed: {gt_prediction}, {pred_prediction}')
 
-                        av_stoi /= args.batch_size
-                        av_estoi /= args.batch_size
-                        av_wer /= args.batch_size
-                        av_cer /= args.batch_size
+                        val_batch_size = len(val_video_paths)
+                        av_stoi /= val_batch_size
+                        av_estoi /= val_batch_size
+                        av_wer /= val_batch_size
+                        av_cer /= val_batch_size
 
                         running_val_stoi += av_stoi
                         running_val_estoi += av_estoi
@@ -388,6 +376,7 @@ def main(args):
                             pred,
                             title='GT vs. Pred Mel-specs',
                             target_spectrogram=gt,
+                            loss=criterion([torch.tensor(gt)], [torch.tensor(pred)], [torch.tensor(target_length)], [torch.tensor(1)])
                         ), global_step=total_iterations)
                         for _type, mel in zip(['gt', 'pred'], [gt, pred]):
                             wav = spec_2_wav(mel.T, hparams)
@@ -397,7 +386,7 @@ def main(args):
                 net.train()  # switch back to training mode
 
             if steps_left == 0:
-                print('Training complete...')
+                log('Training complete...')
                 finished_training = True
                 writer.close()
                 break
@@ -417,7 +406,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=0.001)
     parser.add_argument('--warmup_rate', type=float, default=0.1)
     parser.add_argument('--num_epochs', type=int, default=200)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_workers', type=int, default=5)
     parser.add_argument('--log_every', type=int, default=1)
     parser.add_argument('--checkpoint_path')
@@ -429,14 +418,23 @@ if __name__ == '__main__':
     parser.add_argument('--time_masking', action='store_true')
     parser.add_argument('--erasing', action='store_true')
     parser.add_argument('--random_cropping', action='store_true')
+    parser.add_argument('--min_sample_duration', type=int)
     parser.add_argument('--max_sample_duration', type=int)
+    parser.add_argument('--train_use_duration_range', action='store_true')
+    parser.add_argument('--val_use_duration_range', action='store_true')
+    parser.add_argument('--slicing', action='store_true')
     parser.add_argument('--deepspeech_host')
     parser.add_argument('--reset_optimiser', action='store_true')
     parser.add_argument('--lr_decay', action='store_true')
     parser.add_argument('--eval_n_times', type=int)
-    parser.add_argument('--force_eval_batch_size', action='store_true')
+    parser.add_argument('--force_train_batch_size', action='store_true')
     parser.add_argument('--use_class_weights', action='store_true')
     parser.add_argument('--linear_scaling_lr', action='store_true')
+    parser.add_argument('--num_samples', type=int)
+    parser.add_argument('--pretrained_resnet_path')
+    parser.add_argument('--freeze_encoder', action='store_true')
+    parser.add_argument('--gradient_accumulation_steps', type=int)
+    parser.add_argument('--time_mask_by_frame', action='store_true')
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())
