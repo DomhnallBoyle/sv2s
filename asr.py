@@ -16,7 +16,7 @@ class ASR:
 
     @property
     def average_time(self): 
-        return round(self.total_time_taken / self.num_samples, 1)
+        return round(self.total_time_taken / self.num_samples, 1) if self.num_samples else None
 
     def run(self, audio_path):
         self.num_samples += 1
@@ -82,9 +82,9 @@ class DeepSpeechASR(ASR):
 
 class WhisperASR(ASR): 
     
-    def __init__(self, model, phrases=[]):
+    def __init__(self, model, phrases=[], device='cpu'):
         super().__init__(name='Whisper')
-        self.model = whisper.load_model(model)
+        self.model = whisper.load_model(model, device=device)
         self.vocab = list(set([w for phrase in phrases for w in phrase.split(' ')]))  # vocab is the unique words 
         
     def recognise(self, audio_path): 

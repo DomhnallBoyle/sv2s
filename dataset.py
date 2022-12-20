@@ -15,14 +15,16 @@ from torchvision.transforms import CenterCrop, RandomErasing, Normalize
 from tqdm import tqdm
 
 from hparams import hparams
-from transforms import HorizontalFlipping, IntensityAugmentation, RandomCrop, Slicing, TimeMasking
-from utils import plot_spectrogram, save_wav, spec_2_wav
+from transform import HorizontalFlipping, IntensityAugmentation, RandomCrop, Slicing, TimeMasking
+from utils import plot_spectrogram, save_wav
+from vocoder import griffin_lim
 
 
 class CustomCollate:
 
-    def __init__(self, last_frame_padding=False):
+    def __init__(self, last_frame_padding=False, skip_assert=False):
         self.last_frame_padding = last_frame_padding
+        self.skip_assert = skip_assert
 
     def __call__(self, batch):
         video_paths = [x[0] for x in batch]
@@ -61,11 +63,12 @@ class CustomCollate:
             lengths = torch.Tensor([x.shape[0] for x in windows]).int()
             target_lengths = torch.Tensor([x.shape[0] for x in gt_mel_specs]).int()
 
-        for window, length, gt_mel_spec, target_length in zip(windows, lengths, gt_mel_specs, target_lengths):
-            assert window.shape[0] == int(length)
-            assert (window.shape[0] / hparams.fps) == (gt_mel_spec.shape[0] / hparams.num_mels)
-            assert gt_mel_spec.shape[0] == target_length
-            # assert PAD_VALUE not in gt_mel_spec
+        if not self.skip_assert:
+            for window, length, gt_mel_spec, target_length in zip(windows, lengths, gt_mel_specs, target_lengths):
+                assert window.shape[0] == int(length)
+                assert (window.shape[0] / hparams.fps) == (gt_mel_spec.shape[0] / hparams.num_mels)
+                assert gt_mel_spec.shape[0] == target_length
+                # assert PAD_VALUE not in gt_mel_spec
 
         # # calculate sorted indices of seq length in desc order
         # index_lengths = [[i, w.shape[0]] for i, w in enumerate(windows)]
@@ -94,11 +97,10 @@ class CustomDataset(torch.utils.data.Dataset):
 
     def __init__(self, location, horizontal_flipping=False, intensity_augmentation=False, time_masking=False,
                  erasing=False, random_cropping=False, wait_ms=hparams.fps, num_samples=None, use_class_weights=False,
-                 min_sample_duration=None, max_sample_duration=None, use_duration_range=False, slicing=False, 
-                 time_mask_by_frame=False, debug=False, **kwargs):
+                 min_sample_duration=None, max_sample_duration=None, slicing=False, time_mask_by_frame=False, debug=False, 
+                 **kwargs):
         self.location = Path(location)
         assert self.location.exists()
-        self.lengths_location = self.location.joinpath('lengths.pkl')
         self.augmentation_prob = 0.5
         self.horizontal_flipping = HorizontalFlipping(p=self.augmentation_prob) if horizontal_flipping else None
         self.intensity_augmentation = IntensityAugmentation(p=self.augmentation_prob) if intensity_augmentation else None
@@ -108,30 +110,37 @@ class CustomDataset(torch.utils.data.Dataset):
         self.slicing = Slicing() if slicing else None
         self.wait_ms = wait_ms
         self.num_samples = num_samples
+        self.use_class_weights = use_class_weights
         self.min_sample_duration = min_sample_duration
         self.max_sample_duration = max_sample_duration
-        self.use_duration_range = use_duration_range
         self.time_masking_axis = 0 if time_mask_by_frame else None  # can be frame (0 = vsrml) or pixel value (None = sv2s)
         self.debug = debug
 
+        self.lengths_location = self.location.joinpath('lengths.pkl')
+        self.video_paths_location = self.location.joinpath('video_paths.pkl')
         self.sample_paths = [f'{r}/{f}' for r, ds, fs in os.walk(self.location) for f in fs if f[-4:] == '.npz']
-        self.lengths = self.get_lengths()
+        self.lengths = self.get_stats(location=self.lengths_location, stats_f=self.get_length)
+        self.video_paths = self.get_stats(location=self.video_paths_location, stats_f=self.get_video_path)
         self.samples = self.get_samples()
-        self.class_weights = self.get_class_weights() if use_class_weights else None
+        self.user_weights = self.get_class_weights(_key='get_user') if use_class_weights else None
+        self.phrase_weights = self.get_class_weights(_key='get_phrase') if use_class_weights else None
 
         # https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/14b33789c40f931860994eafdef18d05136ef8ef/dataloader/dataloader.py#L86
         self.normalise_1 = Normalize(mean=0.0, std=255.0)
         self.normalise_2 = Normalize(mean=0.421, std=0.165)
 
-        if self.use_duration_range or self.slicing: 
-            assert self.min_sample_duration is not None and self.max_sample_duration is not None
+        if self.slicing: 
+            assert self.max_sample_duration is not None
 
     def get_samples(self):
         print(f'Getting samples from {self.location}...')
         samples = self.sample_paths.copy()
 
-        if self.use_duration_range:
-            samples = [s for s in samples if self.min_sample_duration <= self.get_duration(s) <= self.max_sample_duration]
+        if self.min_sample_duration:
+            samples = [s for s in samples if self.get_duration(s) >= self.min_sample_duration]
+
+        if self.max_sample_duration and not self.slicing:
+            samples = [s for s in samples if self.get_duration(s) <= self.max_sample_duration]
 
         if self.num_samples is not None:
             random.shuffle(samples)
@@ -153,45 +162,52 @@ class CustomDataset(torch.utils.data.Dataset):
 
         return frames.shape[0]
 
-    def get_lengths(self):
-        print('Getting dataset lengths...')
+    def get_video_path(self, sample_path):
+        return np.load(str(sample_path), allow_pickle=True)['sample'][0]
 
-        if self.lengths_location.exists():
-            with self.lengths_location.open('rb') as f:
+    def get_stats(self, location, stats_f): 
+        print(f'Getting dataset stats for {stats_f.__name__}...')
+
+        if location.exists():
+            with location.open('rb') as f:
                 return pickle.load(f)
 
-        lengths = {}
+        stats = {}
         for sample_path in tqdm(self.sample_paths):
-            lengths[sample_path] = self.get_length(sample_path=sample_path)
+            stats[sample_path] = stats_f(sample_path=sample_path)
 
-        with self.lengths_location.open('wb') as f:
-            pickle.dump(lengths, f)
+        with location.open('wb') as f:
+            pickle.dump(stats, f)
 
-        return lengths
+        return stats
+
+    def get_user(self, video_path): 
+        return Path(video_path).parts[-2]
 
     def get_phrase(self, video_path):
         return Path(video_path).stem.split('_')[0].lower()
 
-    def get_class_weights(self):
-        print('Getting class weights...')
+    def get_class_weights(self, _key):
+        """
+        https://medium.com/gumgum-tech/handling-class-imbalance-by-introducing-sample-weighting-in-the-loss-function-3bdebd8203b4
+
+        Alternative:
+            https://naadispeaks.wordpress.com/2021/07/31/handling-imbalanced-classes-with-weighted-loss-in-pytorch/
+            e.g. {phrase: 1 - (count / len(self)) for phrase, count in class_counts.items()}
+        """
+        print(f'Getting class weights for "{_key}"...')
         class_counts = {}
         for sample_path in tqdm(self.samples):
-            video_path, _, _, _ = np.load(str(sample_path), allow_pickle=True)['sample']
-            phrase = self.get_phrase(video_path)
-            class_counts[phrase] = class_counts.get(phrase, 0) + 1
+            video_path = self.get_video_path(sample_path)
+            _class = getattr(self, _key)(video_path)
+            class_counts[_class] = class_counts.get(_class, 0) + 1
 
         num_classes = len(class_counts)
-        phrases, num_samples_per_class = zip(*class_counts.items())
+        classes, num_samples_per_class = zip(*class_counts.items())
         weights = 1 / np.asarray(num_samples_per_class)
-        weights = (weights / np.sum(weights) * num_classes).tolist()
+        weights = (weights / np.sum(weights) * num_classes).tolist()  # sum(weights) == no. of classes
 
-        # TODO: sklearn get_class_weights
-
-        # https://medium.com/gumgum-tech/handling-class-imbalance-by-introducing-sample-weighting-in-the-loss-function-3bdebd8203b4
-        return {phrase: weight for phrase, weight in zip(phrases, weights)}
-
-        # # https://naadispeaks.wordpress.com/2021/07/31/handling-imbalanced-classes-with-weighted-loss-in-pytorch/
-        # return {phrase: 1 - (count / len(self)) for phrase, count in class_counts.items()}
+        return {_class: weight for _class, weight in zip(classes, weights)}
 
     def __len__(self):
         return len(self.samples)
@@ -241,7 +257,8 @@ class CustomDataset(torch.utils.data.Dataset):
         # normalise frames
         frames = self.normalise_2(self.normalise_1(torch.from_numpy(frames.copy()))).numpy()
 
-        weight = self.class_weights[self.get_phrase(video_path)] if self.class_weights else 1
+        # weight by phrase and user
+        weight = self.user_weights[self.get_user(video_path)] + self.phrase_weights[self.get_phrase(video_path)] if self.use_class_weights else 1
 
         if self.debug:
             for frame in frames:
@@ -294,7 +311,7 @@ if __name__ == '__main__':
                 plt.show()
 
                 audio_path = '/tmp/audio.wav'
-                save_wav(spec_2_wav(gt_mel_spec.T, hparams=hparams), save_path=audio_path, sr=hparams.sample_rate)
+                save_wav(griffin_lim([gt_mel_spec])[0], save_path=audio_path, sr=hparams.sample_rate)
                 playsound(audio_path, block=True)
 
             batch = []

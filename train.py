@@ -12,26 +12,20 @@ from pystoi import stoi
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import utils
 from architecture import V2S
 from asr import DeepSpeechASR
 from dataset import CustomCollate, CustomDataset
 from hparams import hparams
 from loss import CustomLoss
 from optimiser import CustomOptimiser
-from sampler import BucketSampler
-from utils import plot_spectrogram, save_wav, spec_2_wav
-
-log_path = None
-
-
-def log(s):
-    print(s)
-    with log_path.open('a') as f:
-        f.write(f'{s}\n')
+from sampler import BalancedBatchSampler, BucketSampler
+from utils import log, norm_wav, plot_spectrogram, save_wav
+from vocoder import griffin_lim, parallel_wavegan
 
 
 def main(args):
-    global log_path
+    args.gradient_accumulation = args.gradient_accumulation_steps is not None
 
     # seed the randomisers
     torch.manual_seed(hparams.seed)
@@ -41,10 +35,11 @@ def main(args):
     training_output_directory = Path(f'runs/{args.name}')
     checkpoint_directory = training_output_directory.joinpath('checkpoints')
     checkpoint_directory.mkdir(exist_ok=True, parents=True)
-    log_path = training_output_directory.joinpath(f'log_{args.run_index}.txt')
-    with log_path.open('w') as f:
+    utils.log_path = training_output_directory.joinpath(f'log_{args.run_index}.txt')
+    with utils.log_path.open('w') as f:
         for arg in sys.argv:
             f.write(f'{arg} \\\n')
+    log(f'\nHparams: {hparams.__dict__}')
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     log(f'\nUsing: {device}')
@@ -54,7 +49,8 @@ def main(args):
         conformer_type=args.conformer_size, 
         device=device, 
         pretrained_resnet_path=args.pretrained_resnet_path, 
-        freeze_encoder=args.freeze_encoder
+        freeze_encoder=args.freeze_encoder, 
+        group_norm=args.gradient_accumulation
     ).to(device)
 
     # create loss function
@@ -71,17 +67,15 @@ def main(args):
         use_class_weights=args.use_class_weights,
         min_sample_duration=args.min_sample_duration,
         max_sample_duration=args.max_sample_duration,
-        use_duration_range=args.train_use_duration_range,
         slicing=args.slicing,
         time_mask_by_frame=args.time_mask_by_frame,
-        num_samples=args.num_samples
+        num_samples=args.num_dataset_samples
     )
     val_dataset = CustomDataset(
         location=args.val_dataset_location,
         min_sample_duration=args.min_sample_duration,
         max_sample_duration=args.max_sample_duration,
-        use_duration_range=args.val_use_duration_range,
-        num_samples=args.num_samples
+        num_samples=args.num_dataset_samples
     )
 
     # create custom collate fn
@@ -90,26 +84,24 @@ def main(args):
     # create data loaders
     if args.bucketing:
         # ORDER: (1) batch sampler, (2) dataset[i], (3) collate_fn
+        if args.balanced_bucketing:
+            sampler = BalancedBatchSampler(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                force_batch_size=args.force_train_batch_size
+            )
+        else:
+            sampler = BucketSampler(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                force_batch_size=args.force_train_batch_size
+            )
         train_data_loader = torch.utils.data.DataLoader(
             train_dataset,
             num_workers=args.num_workers,
             collate_fn=collator,
             pin_memory=True,
-            batch_sampler=BucketSampler(
-                dataset=train_dataset,
-                batch_size=args.batch_size,
-                force_batch_size=args.force_train_batch_size
-            )
-        )
-        val_data_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            num_workers=1,
-            collate_fn=collator,
-            pin_memory=True,
-            batch_sampler=BucketSampler(
-                dataset=val_dataset,
-                batch_size=args.batch_size
-            )
+            batch_sampler=sampler
         )
     else:
         train_data_loader = torch.utils.data.DataLoader(
@@ -121,17 +113,16 @@ def main(args):
             pin_memory=True,
             drop_last=True
         )
-        val_data_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            num_workers=1,
-            shuffle=True,
-            collate_fn=collator,
-            pin_memory=True,
-            drop_last=True
-        )
 
-    args.gradient_accumulation = args.gradient_accumulation_steps is not None
+    val_data_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=1,
+        num_workers=1,
+        shuffle=True, 
+        collate_fn=collator,
+        pin_memory=True
+    )
+
     if args.linear_scaling_lr:
         # batch size 16 = 0.001 LR
         args.learning_rate *= (args.batch_size / 16)
@@ -188,6 +179,7 @@ def main(args):
         log('Loaded optimiser state')
     else:
         steps_left = num_steps
+        epoch = 0
     total_steps_left = steps_left
     optimiser.init()
     log(f'Warmup steps: {optimiser.warmup_steps}\nSteps left: {steps_left}\n')
@@ -197,7 +189,7 @@ def main(args):
 
     deepspeech_asr = DeepSpeechASR(args.deepspeech_host) if args.deepspeech_host else None
 
-    finished_training = False
+    finished_first_eval, finished_training = False, False
     while not finished_training:
         running_loss, running_step_time = 0, 0
 
@@ -241,26 +233,29 @@ def main(args):
                 running_loss /= args.log_every
                 eta_days = ((running_step_time / args.log_every) * steps_left) / 86400  # in days
                 epoch_progress = round((epoch / num_epochs) * 100, 1)
-                log(f'[Epoch: {epoch}/{num_epochs} ({epoch_progress}%), Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser._rate}] Loss: {running_loss}, ETA: {eta_days:.2f} days')
+                log(f'[Epoch: {epoch}/{num_epochs} ({epoch_progress}%), Iteration: {i + 1}, Total Iteration: {total_iterations}, LR: {optimiser.rate}] Loss: {running_loss}, ETA: {eta_days:.2f} days')
                 writer.add_scalar('Loss/train', running_loss, global_step=total_iterations)
-                writer.add_scalar('LR', optimiser._rate, global_step=total_iterations)
+                writer.add_scalar('LR', optimiser.rate, global_step=total_iterations)
                 running_loss, running_step_time = 0, 0
 
             run_eval = False
+            run_first_eval = not finished_first_eval and i + 1 == 100
             if args.eval_n_times:
                 if steps_left in [int(total_steps_left * x) for x in np.arange(0, 1, 1 / args.eval_n_times)]:
                     run_eval = True
-            elif total_iterations == 100 or (i + 1) == len(train_data_loader) or steps_left == 0:
+            elif run_first_eval or (i + 1) == len(train_data_loader) or steps_left == 0:
                 # eval at 100 steps, at the end of every epoch or at the end of training
                 run_eval = True
         
             if run_eval:
-                log('Running evaluation...')
                 # run validation data
+                log('Running evaluation...')
                 net.eval()  # switch to evaluation mode
+                run_asr = deepspeech_asr and epoch % asr_every_num_epochs == 0
+
                 with torch.no_grad():  # turn off gradients computation
-                    running_val_loss, running_val_stoi, running_val_estoi, running_val_wer, running_val_cer = 0, 0, 0, 0, 0
-                    for j, val_data in enumerate(val_data_loader):
+                    running_val_loss, running_val_gl_stats, running_val_pwgan_stats = 0, [], []
+                    for j, val_data in enumerate(tqdm(val_data_loader, total=args.num_eval_samples)):  # loaders reset from beginning
                         val_video_paths, (val_windows, val_speaker_embeddings, val_lengths), val_gt_mel_specs, val_target_lengths, val_weights = val_data  # batch
                         val_windows = val_windows.to(device)
                         val_speaker_embeddings = val_speaker_embeddings.to(device)
@@ -270,63 +265,65 @@ def main(args):
                         val_outputs = net(val_windows, val_speaker_embeddings, val_lengths)  # expects ([B, 1, T, H, W], [B, 256, 1])
 
                         val_loss = criterion(val_gt_mel_specs, val_outputs, val_target_lengths, val_weights)
-
                         running_val_loss += val_loss.item()
 
-                        # calculate stoi and estoi over a batch
-                        av_stoi, av_estoi, av_wer, av_cer = 0, 0, 0, 0
-                        for val_gt_mel, val_pred_mel in tqdm(zip(val_gt_mel_specs, val_outputs)):
-                            val_gt_mel = val_gt_mel.cpu().numpy()
-                            val_pred_mel = val_pred_mel.cpu().numpy()
-                            
-                            val_gt_wav = spec_2_wav(val_gt_mel.T, hparams)
-                            val_pred_wav = spec_2_wav(val_pred_mel.T, hparams)
-   
+                        val_gt_mel = val_gt_mel_specs[0].cpu().numpy()  # NOTE: only 1 sample per validation batch
+                        val_pred_mel = val_outputs[0].cpu().numpy()
+
+                        # calculate stois and wer/cer of a sample using different vocoders
+                        for vocoder in args.vocoders:
+
+                            if vocoder == 'gl': 
+                                val_gt_wav, val_pred_wav = griffin_lim([val_gt_mel, val_pred_mel])
+                            else:
+                                val_gt_wav, val_pred_wav = parallel_wavegan([val_gt_mel, val_pred_mel], args.pwgan_checkpoint)
+
                             if len(val_gt_wav) > len(val_pred_wav):
                                 val_gt_wav = val_gt_wav[:val_pred_wav.shape[0]]
                             else:
                                 val_pred_wav = val_pred_wav[:val_gt_wav.shape[0]]
- 
-                            av_stoi += stoi(val_gt_wav, val_pred_wav, fs_sig=hparams.sample_rate)
-                            av_estoi += stoi(val_gt_wav, val_pred_wav, fs_sig=hparams.sample_rate, extended=True)
 
-                            if deepspeech_asr and epoch % asr_every_num_epochs == 0:
+                            _stoi = stoi(val_gt_wav, val_pred_wav, fs_sig=hparams.sample_rate)
+                            _estoi = stoi(val_gt_wav, val_pred_wav, fs_sig=hparams.sample_rate, extended=True)
+
+                            _wer, _cer = None, None
+                            if run_asr:
                                 save_wav(val_gt_wav, '/tmp/gt.wav', hparams.sample_rate)
                                 save_wav(val_pred_wav, '/tmp/pred.wav', hparams.sample_rate)
                                 gt_prediction = deepspeech_asr.run('/tmp/gt.wav')[0]
                                 pred_prediction = deepspeech_asr.run('/tmp/pred.wav')[0]
                                 try:
-                                    av_wer += calculate_wer(gt_prediction, pred_prediction)
-                                    av_cer += calculate_cer(gt_prediction, pred_prediction)
-                                except ValueError:
+                                    _wer = calculate_wer(gt_prediction, pred_prediction)
+                                    _cer = calculate_cer(gt_prediction, pred_prediction)
+                                except ValueError:  # usually caused by an empty string in gt or pred
                                     log(f'WER/CER failed: {gt_prediction}, {pred_prediction}')
+                                    continue        
 
-                        val_batch_size = len(val_video_paths)
-                        av_stoi /= val_batch_size
-                        av_estoi /= val_batch_size
-                        av_wer /= val_batch_size
-                        av_cer /= val_batch_size
+                            stats = [_stoi, _estoi, _wer, _cer]
 
-                        running_val_stoi += av_stoi
-                        running_val_estoi += av_estoi
-                        running_val_wer += av_wer
-                        running_val_cer += av_cer
+                            if vocoder == 'gl': 
+                                running_val_gl_stats.append([*stats])
+                            else:
+                                running_val_pwgan_stats.append([*stats])
 
-                        if j == args.num_eval_batches - 1:
+                        if j == args.num_eval_samples - 1:
                             break
 
-                    running_val_loss /= args.num_eval_batches
-                    running_val_stoi /= args.num_eval_batches
-                    running_val_estoi /= args.num_eval_batches
-                    running_val_wer /= args.num_eval_batches
-                    running_val_cer /= args.num_eval_batches
-
-                    writer.add_scalar('Loss/val', running_val_loss, global_step=total_iterations)
-                    writer.add_scalar('Stoi/val', running_val_stoi, global_step=total_iterations)
-                    writer.add_scalar('Estoi/val', running_val_estoi, global_step=total_iterations)
-                    if deepspeech_asr and epoch % asr_every_num_epochs == 0:
-                        writer.add_scalar('WER/val', running_val_wer, global_step=total_iterations)
-                        writer.add_scalar('CER/val', running_val_cer, global_step=total_iterations)
+                    # write stats to tensorboard
+                    writer.add_scalar('Loss/val', running_val_loss / args.num_eval_samples, global_step=total_iterations)
+                    gl_stois, gl_estois, gl_wers, gl_cers = zip(*running_val_gl_stats)
+                    stats_d = {'STOI/val': {'gl': gl_stois}, 'ESTOI/val': {'gl': gl_estois}}
+                    if run_asr:
+                        stats_d.update({'WER/val': {'gl': gl_wers}, 'CER/val': {'gl': gl_cers}})
+                    if running_val_pwgan_stats:
+                        pwgan_stois, pwgan_estois, pwgan_wers, pwgan_cers = zip(*running_val_pwgan_stats)
+                        stats_d['STOI/val']['pwgan'] = pwgan_stois
+                        stats_d['ESTOI/val']['pwgan'] = pwgan_estois
+                        if run_asr:
+                            stats_d['WER/val']['pwgan'] = pwgan_wers
+                            stats_d['CER/val']['pwgan'] = pwgan_cers
+                    for label, stats in stats_d.items():
+                        writer.add_scalars(label, {k: np.mean(v) for k, v in stats.items()}, global_step=total_iterations)
 
                     # save checkpoint if new best val loss, every 5 epochs or at the end of training
                     # don't save at 100 iterations
@@ -346,44 +343,75 @@ def main(args):
                             best_val_loss = running_val_loss
 
                     # save out validation and training samples
-                    for _video_paths, _windows, _lengths, gts, preds, _target_lengths, name in zip(
-                        [video_paths, val_video_paths],
-                        [windows, val_windows],
-                        [lengths, val_lengths],
-                        [gt_mel_specs, val_gt_mel_specs],
-                        [outputs, val_outputs],
-                        [target_lengths, val_target_lengths],
+                    for video_path, window, window_length, gt, pred, target_length, weight, name in zip(
+                        [video_paths[0], val_video_paths[0]],
+                        [windows[0], val_windows[0]],
+                        [lengths[0], val_lengths[0]],
+                        [gt_mel_specs[0], val_gt_mel_specs[0]],
+                        [outputs[0], val_outputs[0]],
+                        [target_lengths[0], val_target_lengths[0]],
+                        [weights[0], val_weights[0]],
                         ['train', 'val']
                     ):
-                        video_path = _video_paths[0]                        
+                        window_length = int(window_length.item())
+                        target_length = int(target_length)
 
-                        window_length = int(_lengths[0].item())
-                        target_length = int(_target_lengths[0])
-
-                        window = _windows[0].cpu().numpy()[:, :window_length]  # random window, de-pad with the length
+                        window = window.cpu().numpy()[:, :window_length]  # random window, de-pad with the length
                         window = np.asarray([cv2.normalize(frame, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                                              for frame in window])  # for displaying purposes
 
-                        gt = gts[0].cpu().numpy()[:target_length]  # remove padding
-                        pred = preds[0].cpu().numpy()[:target_length]
+                        gt = gt.cpu().numpy()[:target_length]  # remove padding
+                        pred = pred.cpu().numpy()[:target_length]
 
                         assert window.shape[1] == window_length
                         assert (gt.shape[0], pred.shape[0]) == (target_length, target_length)
 
-                        writer.add_text(f'Video Path/{name}', video_path, global_step=total_iterations)
                         writer.add_images(f'Window/{name}', window, global_step=total_iterations, dataformats='CNHW')
                         writer.add_figure(f'Figure/{name}', plot_spectrogram(
                             pred,
                             title='GT vs. Pred Mel-specs',
                             target_spectrogram=gt,
-                            loss=criterion([torch.tensor(gt)], [torch.tensor(pred)], [torch.tensor(target_length)], [torch.tensor(1)])
+                            loss=criterion([torch.tensor(gt)], [torch.tensor(pred)], [torch.tensor(target_length)], [torch.tensor(weight)]), 
+                            video_path=video_path
                         ), global_step=total_iterations)
                         for _type, mel in zip(['gt', 'pred'], [gt, pred]):
-                            wav = spec_2_wav(mel.T, hparams)
-                            writer.add_audio(f'Audio/{name}_{_type}', wav, global_step=total_iterations,
-                                             sample_rate=hparams.sample_rate)
+                            writer.add_audio(
+                                f'Audio/{name}_{_type}_gl', 
+                                norm_wav(griffin_lim([mel])[0]), 
+                                global_step=total_iterations,
+                                sample_rate=hparams.sample_rate
+                            )
+                            if args.pwgan_checkpoint:
+                                writer.add_audio(
+                                    f'Audio/{name}_{_type}_pwgan', 
+                                    norm_wav(parallel_wavegan([mel], args.pwgan_checkpoint)[0]), 
+                                    global_step=total_iterations,
+                                    sample_rate=hparams.sample_rate
+                                )
+
+                    # save out the 4 lrs3 v2s samples if applicable
+                    if args.v2s_samples_dataset_location:
+                        assert args.pwgan_checkpoint is not None
+                        test_loader = torch.utils.data.DataLoader(
+                            CustomDataset(args.v2s_samples_dataset_location),
+                            batch_size=1,
+                            num_workers=1,
+                            collate_fn=collator,
+                            pin_memory=True
+                        )
+                        for test_data in tqdm(test_loader):
+                            test_video_paths, (test_windows, test_speaker_embeddings, test_lengths), _, _, _ = test_data
+                            test_outputs = net(test_windows, test_speaker_embeddings, test_lengths)
+                            test_pred_mel = test_outputs[0].cpu().numpy()
+                            writer.add_audio(
+                                f'V2S_Samples:{test_video_paths[0]}', 
+                                norm_wav(parallel_wavegan([test_pred_mel], args.pwgan_checkpoint)[0]),
+                                global_step=total_iterations,
+                                sample_rate=hparams.sample_rate
+                            )
 
                 net.train()  # switch back to training mode
+                finished_first_eval = True
 
             if steps_left == 0:
                 log('Training complete...')
@@ -402,6 +430,7 @@ if __name__ == '__main__':
     parser.add_argument('run_index', type=int)
     parser.add_argument('training_dataset_location')
     parser.add_argument('val_dataset_location')
+    parser.add_argument('--v2s_samples_dataset_location')  # the 4 LRS3 samples
     parser.add_argument('--conformer_size', choices=['s', 'm', 'l'], default='s')
     parser.add_argument('--learning_rate', type=float, default=0.001)
     parser.add_argument('--warmup_rate', type=float, default=0.1)
@@ -410,8 +439,9 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=5)
     parser.add_argument('--log_every', type=int, default=1)
     parser.add_argument('--checkpoint_path')
-    parser.add_argument('--num_eval_batches', type=int, default=16)
+    parser.add_argument('--num_eval_samples', type=int, default=100)
     parser.add_argument('--bucketing', action='store_true')
+    parser.add_argument('--balanced_bucketing', action='store_true')
     parser.add_argument('--last_frame_padding', action='store_true')
     parser.add_argument('--horizontal_flipping', action='store_true')
     parser.add_argument('--intensity_augmentation', action='store_true')
@@ -420,8 +450,6 @@ if __name__ == '__main__':
     parser.add_argument('--random_cropping', action='store_true')
     parser.add_argument('--min_sample_duration', type=int)
     parser.add_argument('--max_sample_duration', type=int)
-    parser.add_argument('--train_use_duration_range', action='store_true')
-    parser.add_argument('--val_use_duration_range', action='store_true')
     parser.add_argument('--slicing', action='store_true')
     parser.add_argument('--deepspeech_host')
     parser.add_argument('--reset_optimiser', action='store_true')
@@ -430,11 +458,13 @@ if __name__ == '__main__':
     parser.add_argument('--force_train_batch_size', action='store_true')
     parser.add_argument('--use_class_weights', action='store_true')
     parser.add_argument('--linear_scaling_lr', action='store_true')
-    parser.add_argument('--num_samples', type=int)
+    parser.add_argument('--num_dataset_samples', type=int)
     parser.add_argument('--pretrained_resnet_path')
     parser.add_argument('--freeze_encoder', action='store_true')
     parser.add_argument('--gradient_accumulation_steps', type=int)
     parser.add_argument('--time_mask_by_frame', action='store_true')
+    parser.add_argument('--pwgan_checkpoint')
+    parser.add_argument('--vocoders', type=lambda s: s.split(','), default=['gl'])
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())

@@ -15,3 +15,4 @@ torchaudio==0.12.1
 torchvision==0.13.1
 tqdm==4.64.1
 git+https://github.com/openai/whisper.git@eff383b#egg=whisper
+git+https://github.com/kan-bayashi/ParallelWaveGAN.git@1f7949f

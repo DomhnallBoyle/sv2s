@@ -32,7 +32,7 @@ def conv2d(in_channels, out_channels, kernel_size, stride, padding):
     )
 
 
-def downsample_block(in_channels, out_channels, stride):
+def downsample_block(in_channels, out_channels, stride, group_norm=False):
     return torch.nn.Sequential(
         conv2d(
             in_channels=in_channels,
@@ -41,7 +41,7 @@ def downsample_block(in_channels, out_channels, stride):
             stride=stride,
             padding=0
         ),
-        torch.nn.BatchNorm2d(num_features=out_channels)
+        torch.nn.BatchNorm2d(num_features=out_channels) if not group_norm else torch.nn.GroupNorm(32, num_channels=out_channels)
     )
 
 
@@ -76,12 +76,12 @@ def initialise_weights(net, init_type):
 
 class Stem(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, group_norm=False):
         super().__init__()
 
         self.conv_3d = conv3d(in_channels=1, out_channels=64, kernel_size=(5, 7, 7), stride=(1, 2, 2),
                               padding=(2, 3, 3))
-        self.batch_norm_3d = torch.nn.BatchNorm3d(num_features=64)
+        self.batch_norm_3d = torch.nn.BatchNorm3d(num_features=64) if not group_norm else torch.nn.GroupNorm(32, num_channels=64)
         self.max_pool_3d = torch.nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
         self.activation = torch.nn.SiLU()
 
@@ -89,22 +89,22 @@ class Stem(torch.nn.Module):
         x = self.conv_3d(x)
         x = self.batch_norm_3d(x)
         x = self.activation(x)
-        x = self.max_pool_3d(x)
+        x = self.max_pool_3d(x)  # same order as vsrml
 
         return x
 
 
 class BasicBlock(torch.nn.Module):
 
-    def __init__(self, in_channels, out_channels, kernel_size, stride, expansion=1, down_sample=None):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expansion=1, down_sample=None, group_norm=False):
         super().__init__()
 
         self.conv_2d_1 = conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
                                 stride=stride, padding=1)
-        self.batch_norm_2d_1 = torch.nn.BatchNorm2d(num_features=out_channels)
+        self.batch_norm_2d_1 = torch.nn.BatchNorm2d(num_features=out_channels) if not group_norm else torch.nn.GroupNorm(32, num_channels=out_channels)
         self.conv_2d_2 = conv2d(in_channels=in_channels * expansion, out_channels=out_channels, kernel_size=kernel_size,
                                 stride=1, padding=1)
-        self.batch_norm_2d_2 = torch.nn.BatchNorm2d(num_features=out_channels)
+        self.batch_norm_2d_2 = torch.nn.BatchNorm2d(num_features=out_channels) if not group_norm else torch.nn.GroupNorm(32, num_channels=out_channels)
         self.down_sample = down_sample
         self.activation = torch.nn.SiLU()
 
@@ -128,25 +128,25 @@ class Encoder(torch.nn.Module):
     Based on https://github.com/mpc001/Visual_Speech_Recognition_for_Multiple_Languages/blob/master/espnet/nets/pytorch_backend/backbones/conv3d_extractor.py
     """
     
-    def __init__(self):
+    def __init__(self, group_norm=False):
         super().__init__()
         
-        self.stem = Stem()
+        self.stem = Stem(group_norm=group_norm)
         self.res_block_1 = torch.nn.Sequential(
-            BasicBlock(64, 64, 3, 1),
-            BasicBlock(64, 64, 3, 1)
+            BasicBlock(64, 64, 3, 1, group_norm=group_norm),
+            BasicBlock(64, 64, 3, 1, group_norm=group_norm)
         )
         self.res_block_2 = torch.nn.Sequential(
-            BasicBlock(64, 128, 3, 2, expansion=2, down_sample=downsample_block(64, 128, 2)),
-            BasicBlock(128, 128, 3, 1)
+            BasicBlock(64, 128, 3, 2, expansion=2, down_sample=downsample_block(64, 128, 2, group_norm=group_norm), group_norm=group_norm),
+            BasicBlock(128, 128, 3, 1, group_norm=group_norm)
         )
         self.res_block_3 = torch.nn.Sequential(
-            BasicBlock(128, 256, 3, 2, expansion=2, down_sample=downsample_block(128, 256, 2)),
-            BasicBlock(256, 256, 3, 1)
+            BasicBlock(128, 256, 3, 2, expansion=2, down_sample=downsample_block(128, 256, 2, group_norm=group_norm), group_norm=group_norm),
+            BasicBlock(256, 256, 3, 1, group_norm=group_norm)
         )
         self.res_block_4 = torch.nn.Sequential(
-            BasicBlock(256, 512, 3, 2, expansion=2, down_sample=downsample_block(256, 512, 2)),
-            BasicBlock(512, 512, 3, 1)
+            BasicBlock(256, 512, 3, 2, expansion=2, down_sample=downsample_block(256, 512, 2, group_norm=group_norm), group_norm=group_norm),
+            BasicBlock(512, 512, 3, 1, group_norm=group_norm)
         )
         self.av_pool_2d = torch.nn.AdaptiveAvgPool2d(output_size=1)
 
@@ -174,7 +174,7 @@ class ESPNetDecoder(torch.nn.Module):
         self.device = device
         self.num_input_features = 768
         
-        # conformer contains initial linear layer before conformer layers
+        # conformer contains initial linear layer before conformer layers i.e. fusion layer for resnet + speaker embedding features
         # also contains positional encoding
         # RELU for ffd layer and swish for conv layer of conformer blocks
         self.conformer = ConformerEncoder(
@@ -215,10 +215,12 @@ class ESPNetDecoder(torch.nn.Module):
 
 class V2S(torch.nn.Module):
 
-    def __init__(self, conformer_type='m', device='cpu', pretrained_resnet_path=None, freeze_encoder=False):
+    def __init__(self, conformer_type='m', device='cpu', pretrained_resnet_path=None, freeze_encoder=False, group_norm=False):
         super().__init__()
 
-        self.encoder = Encoder()
+        # encoder can use batch or group-norm
+        # decoder has a combination of layer (encoder layers) and batch-norm (conv module)
+        self.encoder = Encoder(group_norm=group_norm)
         self.decoder = ESPNetDecoder(conformer_type=conformer_type, device=device)
 
         if pretrained_resnet_path: 

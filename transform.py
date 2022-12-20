@@ -11,7 +11,7 @@ class HorizontalFlipping:
     def __init__(self, p): 
         self.p = p
 
-    def __call__(self): 
+    def __call__(self, frames): 
         if random.random() < self.p:
             frames = frames[..., :, ::-1]  # flip along vertical axis
 

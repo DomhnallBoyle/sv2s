@@ -27,7 +27,7 @@ class HParams:
     # griffin-lim
     power = 1.5
     griffin_lim_iters = 60
-    # griffin_lim_iters = 30
+    # griffin_lim_iters = 30  # doesn't seem to impact that much between 30 and 60
 
     pre_emphasize = True
     pre_emphasis = 0.97
@@ -63,6 +63,10 @@ class HParams:
     }
     seed = 1234
     pad_value = 0.0
+
+    @property
+    def __dict__(self): 
+        return {a: getattr(self, a) for a in dir(self) if a[0] != '_'}
 
 
 hparams = HParams()
