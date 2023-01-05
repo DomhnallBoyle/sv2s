@@ -95,6 +95,8 @@ class CustomCollate:
 
 class CustomDataset(torch.utils.data.Dataset):
 
+    # TODO: default min sample duration? e.g. 1 or 2 seconds
+    #  changes to get_random_duration_num_frames()
     def __init__(self, location, horizontal_flipping=False, intensity_augmentation=False, time_masking=False,
                  erasing=False, random_cropping=False, wait_ms=hparams.fps, num_samples=None, use_class_weights=False,
                  min_sample_duration=None, max_sample_duration=None, slicing=False, time_mask_by_frame=False, debug=False, 

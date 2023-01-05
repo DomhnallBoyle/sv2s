@@ -2,15 +2,17 @@ class HParams:
 
     num_mels = 80
 
-    # mel-spec
-    n_fft = 800
-    sample_rate = 16000
-    win_size = 800
-    hop_size = 200
-    # n_fft = 2048
-    # sample_rate = 24000
-    # win_size = 1200
-    # hop_size = 300
+    # mel-spec - lip2wav
+    # n_fft = 800
+    # sample_rate = 16000
+    # win_size = 800
+    # hop_size = 200
+    
+    # mel-spec - sv2s
+    n_fft = 2048
+    sample_rate = 24000
+    win_size = 1200
+    hop_size = 300
 
     # mel-spec norm and clipping
     signal_normalization = True

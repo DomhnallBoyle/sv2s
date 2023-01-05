@@ -170,6 +170,7 @@ def main(args):
         params=net.parameters(),
         target_lr=args.learning_rate,
         num_steps=num_steps / args.gradient_accumulation_steps if args.gradient_accumulation else num_steps,
+        incremental_warmup=args.incremental_warmup,
         warmup_rate=args.warmup_rate,
         decay=args.lr_decay
     )
@@ -401,6 +402,9 @@ def main(args):
                         )
                         for test_data in tqdm(test_loader):
                             test_video_paths, (test_windows, test_speaker_embeddings, test_lengths), _, _, _ = test_data
+                            test_windows = test_windows.to(device)
+                            test_speaker_embeddings = test_speaker_embeddings.to(device)
+                            test_lengths = test_lengths.to(device)
                             test_outputs = net(test_windows, test_speaker_embeddings, test_lengths)
                             test_pred_mel = test_outputs[0].cpu().numpy()
                             writer.add_audio(
@@ -433,6 +437,7 @@ if __name__ == '__main__':
     parser.add_argument('--v2s_samples_dataset_location')  # the 4 LRS3 samples
     parser.add_argument('--conformer_size', choices=['s', 'm', 'l'], default='s')
     parser.add_argument('--learning_rate', type=float, default=0.001)
+    parser.add_argument('--incremental_warmup', action='store_true')
     parser.add_argument('--warmup_rate', type=float, default=0.1)
     parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=16)

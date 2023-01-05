@@ -8,16 +8,18 @@ class CustomOptimiser:
     Warm-up learning rate for first 10% of iterations and then decay
     """
 
-    def __init__(self, params, target_lr, num_steps, warmup_rate, decay=False, num_restarts=None, num_first_restart_iters=None, restart_iteration_factor=1):
+    def __init__(self, params, target_lr, num_steps, incremental_warmup, warmup_rate=0.1, decay=False, num_restarts=None, num_first_restart_iters=None, restart_iteration_factor=1):
         self.params = params
         self.target_lr = target_lr
         self.num_steps = num_steps
+        self.incremental_warmup = incremental_warmup
+        self.warmup_rate = warmup_rate
         self.decay = decay
         self.num_restarts = num_restarts
         self.num_first_restart_iters = num_first_restart_iters 
         self.restart_iteration_factor = restart_iteration_factor
         self.step_counter = 0
-        self.warmup_steps = int(num_steps * warmup_rate)
+        self.warmup_steps = int(num_steps * self.warmup_rate)
         self.rate = 0
         self.optimiser = None
         self.cosine_scheduler = None
@@ -57,8 +59,11 @@ class CustomOptimiser:
         self.optimiser.step()
 
         if self.step_counter <= self.warmup_steps:
-            # https://stackoverflow.com/questions/55933867/what-does-learning-rate-warm-up-mean
-            lr = self.step_counter * (self.target_lr / self.warmup_steps)
+            if self.incremental_warmup:
+                # https://stackoverflow.com/questions/55933867/what-does-learning-rate-warm-up-mean
+                lr = self.step_counter * (self.target_lr / self.warmup_steps)
+            else:
+                lr = self.target_lr
             self.update_params(lr=lr)
         elif not self.decay:
             lr = self.target_lr

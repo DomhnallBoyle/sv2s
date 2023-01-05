@@ -15,7 +15,6 @@ class BucketSampler(Sampler):
         for k, v in kwargs.items():
             setattr(self, k, v)
         self.num_batches = 0
-        self.batch_map = self._generate_batch_map()
         self._generate_batch_list_wrapper()
 
     def _generate_batch_map(self):
@@ -25,6 +24,7 @@ class BucketSampler(Sampler):
 
             index = [i, None]
             if self.dataset.slicing and self.dataset.get_duration(sample) > self.dataset.max_sample_duration:
+                # this method needs called every iter to select new unique samples
                 length = self.dataset.get_random_duration_num_frames()
                 index[1] = length
 
@@ -35,7 +35,7 @@ class BucketSampler(Sampler):
         return batch_map
 
     def _generate_batch_list_wrapper(self):
-        batch_list = self._generate_batch_list()
+        batch_list = self._generate_batch_list(self._generate_batch_map())
 
         if self.force_batch_size:
             batch_list = [b for b in batch_list if len(b) == self.batch_size]
@@ -44,9 +44,7 @@ class BucketSampler(Sampler):
 
         return batch_list
 
-    def _generate_batch_list(self):
-        batch_map = self.batch_map.copy()
-
+    def _generate_batch_list(self, batch_map):
         for indices in batch_map.values(): 
             random.shuffle(indices)  # indices put into different batches
 
@@ -81,9 +79,7 @@ class BalancedBatchSampler(BucketSampler):
     def __init__(self, dataset, batch_size, force_batch_size=False): 
         super().__init__(dataset, batch_size, force_batch_size, max_attempts=100)
 
-    def _generate_batch_list(self):
-        batch_map = self.batch_map.copy()
-
+    def _generate_batch_list(self, batch_map):
         batch_list = []
         for indices in batch_map.values():  # ensuring samples in batch have same length
             samples = [self.dataset.samples[i[0]] for i in indices]
